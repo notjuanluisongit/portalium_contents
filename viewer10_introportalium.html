@@ -1,0 +1,3351 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDF Viewer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+<style>
+
+  :root {
+    --accent: rgba(210,179,223,0.95);
+    --bg: transparent;
+    --text: rgba(255,255,255,0.92);
+    --shadow-soft: 0 2px 5px rgba(0,0,0,0.55);
+    --shadow-strong: 0 4px 14px rgba(0,0,0,0.6);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    background: var(--bg);
+    width: 100%;
+    height: 100vh;
+    overflow: hidden;
+    font-family: Helvetica, Arial, sans-serif;
+  }
+
+  #viewer {
+    position: fixed;
+    inset: 0;
+    bottom: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    /* Perspectiva 3D para el efecto de "pasar pagina" (rotateY). Sin
+       esto el rotateY se veria plano, sin sensacion de profundidad. */
+    perspective: 1600px;
+    /* Evita que el navegador interprete gestos propios (paneo/zoom con
+       trackpad, scroll elastico, etc.) mientras arrastramos o hacemos
+       zoom a mano. Sin esto, en varios navegadores el gesto nativo y
+       nuestro JS "pelean" por el mismo movimiento y eso se siente como
+       trabas/saltos durante el drag o la ruedita. */
+    touch-action: none;
+    overscroll-behavior: contain;
+  }
+
+  #pan-layer {
+    /* Esta capa SOLO se mueve (translate): drag manual y el offset que
+       compensa el punto de anclaje al hacer zoom con la ruedita. En
+       modo 2 paginas tambien es la que alinea ambas paginas del spread
+       lado a lado. Ya NO rota — la rotacion del "pasar pagina" vive en
+       cada .leaf por separado (ver mas abajo), para que en modo doble
+       solo gire la hoja que corresponde y no las dos juntas como si
+       fueran una sola placa plana. */
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 3px;
+    will-change: transform;
+    /* Necesario para que el rotateY 3D de los .leaf (que estan un nivel
+       mas abajo) se siga viendo con la perspectiva definida en #viewer,
+       en vez de aplanarse. */
+    transform-style: preserve-3d;
+    /* Aisla el layout/paint de esta capa del resto del documento, asi
+       el navegador no tiene que recalcular nada fuera de esta caja en
+       cada frame de drag. */
+    contain: layout paint;
+  }
+
+  /* Cada "hoja" del libro (una por pagina visible) es la que gira con
+     el efecto de pasar pagina. Separarla de #canvas-wrap permite que
+     esa rotacion nunca choque con el scale3d que #canvas-wrap usa para
+     el preview de zoom con la ruedita. */
+  .leaf {
+    position: relative;
+    z-index: 1;
+    will-change: transform, opacity;
+    backface-visibility: hidden;
+    -webkit-backface-visibility: hidden;
+  }
+
+  #leaf-2 {
+    display: none;
+  }
+
+  /* Sombra de "pagina girando": un div plano de color solido en vez de
+     un filter:brightness() sobre el contenido. Un filter fuerza al
+     navegador a repintar los pixeles del canvas en cada frame (caro,
+     sobre todo con 2 canvases a la vez en modo doble); un div de color
+     solido con opacity es pura composicion GPU, mucho mas barato y es
+     lo que elimina el stutter. */
+  .flip-shade {
+    position: absolute;
+    inset: 0;
+    background: #000;
+    opacity: 0;
+    pointer-events: none;
+    z-index: 4;
+    will-change: opacity;
+  }
+
+  #canvas-wrap, #canvas-wrap-2 {
+    position: relative;
+    /* Esta capa SOLO escala (scale) durante el preview del zoom con la
+       ruedita. El transform-origin se fija dinamicamente en JS, en el
+       punto exacto donde esta el cursor, para que el zoom crezca desde
+       ahi y no desde el centro. Separarla del pan evita que el translate
+       quede "atrapado" dentro del scale (lo que causaba saltos raros). */
+    will-change: transform;
+    contain: layout paint;
+  }
+
+  canvas {
+    display: block;
+    /* Valor de arranque, antes de que loadPdf() haga el primer render.
+       A partir de ahi, updateCanvasShadow() en JS toma el control y la
+       recalcula segun el zoom actual — ver esa funcion para el porque. */
+    box-shadow: 0 14px 44px rgba(0,0,0,0.45), 0 4px 16px rgba(0,0,0,0.3);
+  }
+
+  /* Capa de texto seleccionable de PDF.js */
+  .textLayer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    overflow: hidden;
+    line-height: 1;
+    opacity: 1;
+    z-index: 2;
+  }
+
+  .textLayer span,
+  .textLayer br {
+    color: transparent;
+    position: absolute;
+    white-space: pre;
+    cursor: text;
+    transform-origin: 0% 0%;
+  }
+
+  .textLayer ::selection {
+    background: rgba(210,179,223,0.35);
+  }
+
+  /* Resaltado de coincidencias de busqueda directamente sobre el texto
+     de la pagina (ademas de la lista de resultados). El texto de esta
+     capa es invisible (color:transparent) porque el dibujo real esta
+     en el canvas de abajo; el <mark> solo pinta un fondo detras de las
+     letras correspondientes, simulando un marcador. */
+  .textLayer mark.search-highlight {
+    background: rgba(210,179,223,0.35);
+    color: transparent;
+    border-radius: 2px;
+  }
+
+  .textLayer mark.search-highlight-active {
+    background: rgba(210,179,223,0.7);
+  }
+
+  /* Capa de anotaciones (links/hyperlinks del PDF) */
+  .annotationLayer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    z-index: 3;
+  }
+
+  .annotationLayer a {
+    cursor: pointer;
+  }
+
+  .annotationLayer a:hover {
+    outline: 1px solid rgba(210,179,223,0.6);
+    outline-offset: 1px;
+    background: rgba(210,179,223,0.08);
+  }
+
+  .click-zone {
+    position: fixed;
+    top: 0;
+    bottom: 64px;
+    width: 22%;
+    z-index: 10;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.7;
+    transition: opacity 0.25s ease;
+    pointer-events: none;
+  }
+
+  .click-zone .icon-circle { pointer-events: auto; }
+
+  .click-zone:hover { opacity: 1; }
+
+  .icon-circle {
+    width: 54px;
+    height: 54px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,0,0,0.4);
+    backdrop-filter: blur(8px);
+    box-shadow: var(--shadow-strong), inset 0 0 0 1px rgba(255,255,255,0.15);
+    transition: transform 0.25s ease, background 0.25s ease;
+    cursor: pointer;
+  }
+
+  .click-zone:hover .icon-circle {
+    background: rgba(0,0,0,0.6);
+    transform: scale(1.1);
+  }
+
+  .click-zone svg {
+    width: 26px;
+    height: 26px;
+    stroke: #fff;
+    fill: none;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    filter: drop-shadow(var(--shadow-soft));
+  }
+
+  #zone-prev { left: 0; justify-content: flex-start; padding-left: 18px; }
+  #zone-next { right: 0; justify-content: flex-end; padding-right: 18px; }
+
+  /* ---- Toolbar superior (buscar / pantalla completa) — solo iconos ---- */
+  #top-toolbar {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    z-index: 30;
+    display: flex;
+    gap: 8px;
+  }
+
+  .icon-btn {
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(0,0,0,0.4);
+    backdrop-filter: blur(8px);
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: var(--shadow-strong), inset 0 0 0 1px rgba(255,255,255,0.15);
+    transition: background 0.2s ease, transform 0.2s ease, color 0.2s ease;
+  }
+
+  .icon-btn:hover {
+    background: rgba(0,0,0,0.6);
+    transform: scale(1.08);
+    color: var(--accent);
+  }
+
+  .icon-btn.active {
+    color: var(--accent);
+    background: rgba(0,0,0,0.6);
+  }
+
+  .icon-btn svg {
+    width: 17px;
+    height: 17px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    filter: drop-shadow(var(--shadow-soft));
+  }
+
+  #controls {
+    position: fixed;
+    bottom: 12px;
+    left: 0;
+    right: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    z-index: 20;
+    flex-wrap: wrap;
+  }
+
+  .ctrl-btn {
+    background: none;
+    border: none;
+    border-radius: 8px;
+    color: var(--text);
+    text-shadow: var(--shadow-soft);
+    cursor: pointer;
+    padding: 8px 12px;
+    font-family: Helvetica, Arial, sans-serif;
+    font-size: 0.68rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    transition: color 0.2s ease, background 0.2s ease, transform 0.2s ease;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .ctrl-btn:hover {
+    color: var(--accent);
+    background: rgba(0,0,0,0.35);
+    backdrop-filter: blur(6px);
+  }
+
+  .ctrl-btn.active {
+    color: var(--accent);
+    background: rgba(0,0,0,0.35);
+    backdrop-filter: blur(6px);
+  }
+
+  .ctrl-btn svg {
+    width: 15px;
+    height: 15px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    filter: drop-shadow(var(--shadow-soft));
+  }
+
+  .ctrl-divider {
+    width: 1px;
+    height: 18px;
+    background: rgba(255,255,255,0.3);
+    box-shadow: 0 0 4px rgba(0,0,0,0.5);
+    margin: 0 4px;
+  }
+
+  #page-info {
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    color: var(--text);
+    text-shadow: var(--shadow-soft);
+    min-width: 64px;
+    text-align: center;
+  }
+
+  #zoom-info {
+    font-size: 0.65rem;
+    color: var(--text);
+    text-shadow: var(--shadow-soft);
+    min-width: 40px;
+    text-align: center;
+  }
+
+  #loader {
+    position: fixed;
+    inset: 0;
+    background: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    transition: opacity 0.4s ease;
+  }
+
+  #loader.hidden { opacity: 0; pointer-events: none; }
+
+  .loader-dot {
+    width: 4px;
+    height: 4px;
+    background: var(--accent);
+    border-radius: 50%;
+    margin: 0 4px;
+    animation: dotPulse 1.2s ease infinite;
+  }
+
+  .loader-dot:nth-child(2) { animation-delay: 0.2s; }
+  .loader-dot:nth-child(3) { animation-delay: 0.4s; }
+
+  @keyframes dotPulse {
+    0%, 80%, 100% { opacity: 0.2; transform: scale(0.8); }
+    40% { opacity: 1; transform: scale(1); }
+  }
+
+  #error-box {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 90;
+    color: var(--text);
+    text-align: center;
+    padding: 24px;
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+
+  /* ---- Preview de link (favicon/oEmbed) y preview de imagen (grande) ---- */
+  #link-preview.image-preview {
+    max-width: 340px;
+    padding: 6px;
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  #link-preview.image-preview img {
+    width: 100%;
+    max-height: 220px;
+    object-fit: contain;
+    border-radius: 6px;
+    display: block;
+    background: rgba(0,0,0,0.25);
+  }
+
+  #link-preview.image-preview .image-preview-caption {
+    margin-top: 6px;
+    font-size: 0.68rem;
+    opacity: 0.75;
+    word-break: break-all;
+  }
+
+  /* ---- Overlay de embed (YouTube/Vimeo renderizado, no el codigo) ---- */
+  #embed-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 48px 24px;
+    background: rgba(0,0,0,0.86);
+    backdrop-filter: blur(10px);
+  }
+
+  #embed-overlay.visible { display: flex; }
+
+  #embed-overlay-newtab {
+    position: fixed;
+    top: 18px;
+    left: 18px;
+    z-index: 61;
+    display: none;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
+    border-radius: 20px;
+    background: rgba(255,255,255,0.08);
+    color: var(--text);
+    text-decoration: none;
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    box-shadow: var(--shadow-strong), inset 0 0 0 1px rgba(255,255,255,0.15);
+    transition: background 0.2s ease, transform 0.2s ease;
+  }
+
+  #embed-overlay-newtab.visible { display: flex; }
+
+  #embed-overlay-newtab:hover {
+    background: rgba(255,255,255,0.18);
+    transform: scale(1.04);
+  }
+
+  #embed-overlay-close {
+    position: fixed;
+    top: 18px;
+    right: 18px;
+    z-index: 61;
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(255,255,255,0.08);
+    color: var(--text);
+    font-size: 1.1rem;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: var(--shadow-strong), inset 0 0 0 1px rgba(255,255,255,0.15);
+    transition: background 0.2s ease, transform 0.2s ease;
+  }
+
+  #embed-overlay-close:hover {
+    background: rgba(255,255,255,0.18);
+    transform: scale(1.08);
+  }
+
+  #embed-overlay-content {
+    position: relative;
+    width: 100%;
+    max-width: 860px;
+    aspect-ratio: 16 / 9;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: var(--shadow-strong);
+    background: rgba(0,0,0,0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Sitios interactivos (three.js, CodePen, etc.) aprovechan mas espacio
+     en vez del recorte fijo de video 16:9. */
+  #embed-overlay-content.wide {
+    max-width: 1100px;
+    width: 100%;
+    height: 100%;
+    aspect-ratio: auto;
+  }
+
+  #embed-overlay-content iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
+    display: block;
+  }
+
+  #embed-overlay-content .embed-overlay-loading {
+    display: flex;
+    gap: 8px;
+  }
+
+  #embed-overlay-content .embed-overlay-loading span {
+    width: 6px;
+    height: 6px;
+    background: var(--accent);
+    border-radius: 50%;
+    animation: dotPulse 1.2s ease infinite;
+  }
+
+  #embed-overlay-content .embed-overlay-loading span:nth-child(2) { animation-delay: 0.2s; }
+  #embed-overlay-content .embed-overlay-loading span:nth-child(3) { animation-delay: 0.4s; }
+
+  /* ---- Mini visor de PDF simple (para links a PDF, en vez del visor
+     nativo del navegador dentro de un iframe) ---- */
+  .mini-pdf-viewer {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    gap: 10px;
+  }
+
+  .mini-pdf-canvas-wrap {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+
+  .mini-pdf-canvas-wrap canvas {
+    max-width: 100%;
+    max-height: 100%;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+  }
+
+  .mini-pdf-controls {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-shrink: 0;
+    padding-bottom: 4px;
+  }
+
+  .mini-pdf-btn {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(255,255,255,0.08);
+    color: var(--text);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s ease, transform 0.15s ease, opacity 0.2s ease;
+  }
+
+  .mini-pdf-btn:hover { background: rgba(210,179,223,0.22); transform: scale(1.06); }
+
+  .mini-pdf-btn:disabled {
+    opacity: 0.35;
+    cursor: default;
+    transform: none;
+  }
+
+  .mini-pdf-btn svg {
+    width: 16px;
+    height: 16px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  #mini-pdf-info {
+    font-size: 0.7rem;
+    letter-spacing: 0.08em;
+    color: var(--text);
+    opacity: 0.85;
+    min-width: 60px;
+    text-align: center;
+  }
+
+  .mini-pdf-loading {
+    display: flex;
+    gap: 8px;
+  }
+
+  /* ---- Reproductor de audio flotante ---- */
+  #audio-player {
+    position: fixed;
+    bottom: 64px;
+    right: 16px;
+    z-index: 40;
+    display: none;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 14px;
+    background: rgba(20,20,20,0.85);
+    backdrop-filter: blur(10px);
+    box-shadow: var(--shadow-strong), inset 0 0 0 1px rgba(255,255,255,0.12);
+    color: var(--text);
+    font-family: Helvetica, Arial, sans-serif;
+    max-width: 280px;
+  }
+
+  #audio-player.visible { display: flex; }
+
+  #audio-player .ap-btn {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    background: rgba(210,179,223,0.18);
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.2s ease, transform 0.15s ease;
+  }
+
+  #audio-player .ap-btn:hover {
+    background: rgba(210,179,223,0.32);
+    transform: scale(1.06);
+  }
+
+  #audio-player .ap-btn svg {
+    width: 15px;
+    height: 15px;
+    fill: var(--accent);
+    stroke: none;
+  }
+
+  #audio-player .ap-info {
+    flex: 1;
+    min-width: 0;
+  }
+
+  #audio-player .ap-title {
+    font-size: 0.7rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  #audio-player .ap-bar {
+    position: relative;
+    height: 3px;
+    border-radius: 2px;
+    background: rgba(255,255,255,0.2);
+    margin-top: 6px;
+    cursor: pointer;
+  }
+
+  #audio-player .ap-bar-fill {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 0%;
+    background: var(--accent);
+    border-radius: 2px;
+    pointer-events: none;
+  }
+
+  #audio-player .ap-close {
+    background: none;
+    border: none;
+    color: var(--text);
+    opacity: 0.6;
+    cursor: pointer;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+    line-height: 1;
+  }
+
+  #audio-player .ap-close:hover { opacity: 1; }
+
+  /* ---- Panel de miniaturas (activable/desactivable) ---- */
+  #thumbnails-panel {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 64px;
+    z-index: 25;
+    display: none;
+    padding: 12px 16px 8px;
+    background: rgba(14,14,12,0.9);
+    backdrop-filter: blur(12px);
+    border-top: 1px solid rgba(255,255,255,0.08);
+    box-shadow: 0 -6px 18px rgba(0,0,0,0.45);
+  }
+
+  #thumbnails-panel.visible { display: block; }
+
+  #thumbnails-track {
+    display: flex;
+    gap: 12px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 2px 2px 8px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(210,179,223,0.4) transparent;
+  }
+
+  #thumbnails-track::-webkit-scrollbar { height: 6px; }
+  #thumbnails-track::-webkit-scrollbar-thumb {
+    background: rgba(210,179,223,0.35);
+    border-radius: 3px;
+  }
+  #thumbnails-track::-webkit-scrollbar-track { background: transparent; }
+
+  .thumb-item {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    opacity: 0.55;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+  }
+
+  .thumb-item:hover {
+    opacity: 0.9;
+    transform: translateY(-2px);
+  }
+
+  .thumb-item.active {
+    opacity: 1;
+  }
+
+  .thumb-canvas-wrap {
+    border-radius: 6px;
+    overflow: hidden;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+    outline: 2px solid transparent;
+    outline-offset: 2px;
+    transition: outline-color 0.2s ease;
+    background: rgba(255,255,255,0.04);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 40px;
+  }
+
+  .thumb-item.active .thumb-canvas-wrap {
+    outline-color: var(--accent);
+  }
+
+  .thumb-canvas-wrap canvas {
+    display: block;
+    box-shadow: none;
+  }
+
+  .thumb-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 14px 10px;
+  }
+
+  .thumb-label {
+    font-size: 0.6rem;
+    letter-spacing: 0.05em;
+    color: var(--text);
+    text-shadow: var(--shadow-soft);
+    opacity: 0.85;
+  }
+
+  /* ---- Panel de capitulos (mapa visual del indice / bookmarks) ---- */
+  #chapters-panel {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 64px;
+    z-index: 25;
+    display: none;
+    padding: 14px 16px;
+    max-height: 340px;
+    overflow-y: auto;
+    background: rgba(14,14,12,0.9);
+    backdrop-filter: blur(12px);
+    border-top: 1px solid rgba(255,255,255,0.08);
+    box-shadow: 0 -6px 18px rgba(0,0,0,0.45);
+    scrollbar-width: thin;
+    scrollbar-color: rgba(210,179,223,0.4) transparent;
+  }
+
+  #chapters-panel.visible { display: block; }
+
+  #chapters-track {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 14px;
+  }
+
+  .chapter-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+  }
+
+  .chapter-card:hover {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+
+  .chapter-card.active { opacity: 1; }
+
+  .chapter-thumb {
+    border-radius: 6px;
+    overflow: hidden;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+    outline: 2px solid transparent;
+    outline-offset: 2px;
+    transition: outline-color 0.2s ease;
+    background: rgba(255,255,255,0.04);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 44px;
+  }
+
+  .chapter-card.active .chapter-thumb { outline-color: var(--accent); }
+
+  .chapter-thumb canvas { display: block; box-shadow: none; width: 100%; height: auto; }
+
+  .chapter-title {
+    font-size: 0.68rem;
+    color: var(--text);
+    text-shadow: var(--shadow-soft);
+    line-height: 1.3;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .chapter-title .chapter-page {
+    color: var(--accent);
+    opacity: 0.85;
+    font-size: 0.6rem;
+    letter-spacing: 0.05em;
+    display: block;
+    margin-top: 2px;
+  }
+
+  .chapter-subitem {
+    padding-left: 10px;
+    border-left: 2px solid rgba(210,179,223,0.25);
+    margin-top: 2px;
+  }
+
+  .chapters-empty {
+    font-size: 0.72rem;
+    color: var(--text);
+    opacity: 0.55;
+    padding: 8px 4px;
+    grid-column: 1 / -1;
+  }
+
+  /* ---- Panel de busqueda (activable/desactivable) ---- */
+  #search-panel {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 64px;
+    z-index: 25;
+    display: none;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px 16px;
+    max-height: 320px;
+    background: rgba(14,14,12,0.9);
+    backdrop-filter: blur(12px);
+    border-top: 1px solid rgba(255,255,255,0.08);
+    box-shadow: 0 -6px 18px rgba(0,0,0,0.45);
+  }
+
+  #search-panel.visible { display: flex; }
+
+  #search-input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 10px;
+    padding: 8px 12px;
+    flex-shrink: 0;
+  }
+
+  #search-input-row svg {
+    width: 15px;
+    height: 15px;
+    stroke: var(--accent);
+    fill: none;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    flex-shrink: 0;
+  }
+
+  #search-input {
+    flex: 1;
+    min-width: 0;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-family: Helvetica, Arial, sans-serif;
+    font-size: 0.8rem;
+  }
+
+  #search-input::placeholder { color: rgba(255,255,255,0.4); }
+
+  #search-count {
+    font-size: 0.65rem;
+    color: var(--text);
+    opacity: 0.6;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  #search-nav {
+    display: flex;
+    gap: 2px;
+    flex-shrink: 0;
+  }
+
+  #search-nav button {
+    background: none;
+    border: none;
+    color: var(--text);
+    opacity: 0.7;
+    cursor: pointer;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    transition: opacity 0.15s ease, background 0.15s ease;
+  }
+
+  #search-nav button:hover {
+    opacity: 1;
+    background: rgba(255,255,255,0.08);
+  }
+
+  #search-nav svg {
+    width: 14px;
+    height: 14px;
+    stroke: currentColor;
+    fill: none;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  #search-results {
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(210,179,223,0.4) transparent;
+  }
+
+  #search-results::-webkit-scrollbar { width: 6px; }
+  #search-results::-webkit-scrollbar-thumb {
+    background: rgba(210,179,223,0.35);
+    border-radius: 3px;
+  }
+
+  .search-result-item {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+
+  .search-result-item:hover { background: rgba(255,255,255,0.06); }
+  .search-result-item.active-match { background: rgba(210,179,223,0.14); }
+
+  .search-result-page {
+    font-size: 0.62rem;
+    letter-spacing: 0.06em;
+    color: var(--accent);
+    flex-shrink: 0;
+    min-width: 46px;
+  }
+
+  .search-result-snippet {
+    font-size: 0.72rem;
+    color: var(--text);
+    opacity: 0.85;
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .search-result-snippet mark {
+    background: rgba(210,179,223,0.35);
+    color: var(--text);
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+
+  .search-empty, .search-hint {
+    font-size: 0.7rem;
+    color: var(--text);
+    opacity: 0.5;
+    padding: 8px 4px;
+  }
+
+</style>
+</head>
+<body>
+
+<div id="loader">
+  <div class="loader-dot"></div>
+  <div class="loader-dot"></div>
+  <div class="loader-dot"></div>
+</div>
+
+<div id="error-box"></div>
+
+<div id="viewer">
+  <div id="pan-layer">
+    <div id="leaf-1" class="leaf">
+      <div id="canvas-wrap">
+        <canvas id="pdf"></canvas>
+        <div id="text-layer" class="textLayer"></div>
+        <div id="annotation-layer" class="annotationLayer"></div>
+      </div>
+      <div class="flip-shade" id="shade-1"></div>
+    </div>
+    <div id="leaf-2" class="leaf">
+      <div id="canvas-wrap-2">
+        <canvas id="pdf-2"></canvas>
+        <div id="text-layer-2" class="textLayer"></div>
+        <div id="annotation-layer-2" class="annotationLayer"></div>
+      </div>
+      <div class="flip-shade" id="shade-2"></div>
+    </div>
+  </div>
+</div>
+
+<div class="click-zone" id="zone-prev">
+  <div class="icon-circle">
+    <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+  </div>
+</div>
+<div class="click-zone" id="zone-next">
+  <div class="icon-circle">
+    <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
+  </div>
+</div>
+
+<div id="top-toolbar">
+  <button class="icon-btn" id="btn-search" title="Buscar">
+    <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+  </button>
+  <button class="icon-btn" id="btn-chapters" title="Mapa de capítulos">
+    <svg viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+  </button>
+  <button class="icon-btn" id="btn-fullscreen" title="Pantalla completa">
+    <svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+  </button>
+</div>
+
+<div id="thumbnails-panel">
+  <div id="thumbnails-track"></div>
+</div>
+
+<div id="chapters-panel">
+  <div id="chapters-track"></div>
+</div>
+
+<div id="search-panel">
+  <div id="search-input-row">
+    <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+    <input type="text" id="search-input" placeholder="Buscar en el documento…" autocomplete="off" />
+    <span id="search-count"></span>
+    <div id="search-nav">
+      <button id="search-prev" title="Resultado anterior">
+        <svg viewBox="0 0 24 24"><polyline points="18 15 12 9 6 15"/></svg>
+      </button>
+      <button id="search-next" title="Resultado siguiente">
+        <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+    </div>
+  </div>
+  <div id="search-results"></div>
+</div>
+
+<div id="controls">
+  <button class="ctrl-btn" id="btn-prev">
+    <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+  </button>
+
+  <span id="page-info">— / —</span>
+
+  <button class="ctrl-btn" id="btn-next">
+    <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
+  </button>
+
+  <div class="ctrl-divider"></div>
+
+  <button class="ctrl-btn" id="btn-zoom-out">
+    <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+  </button>
+
+  <span id="zoom-info">100%</span>
+
+  <button class="ctrl-btn" id="btn-zoom-in">
+    <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></svg>
+  </button>
+
+  <button class="ctrl-btn" id="btn-reset">
+    <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+  </button>
+
+  <div class="ctrl-divider"></div>
+
+  <button class="ctrl-btn" id="btn-scroll-zoom">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.22 4.22l2.12 2.12M17.66 17.66l2.12 2.12M2 12h3M19 12h3M4.22 19.78l2.12-2.12M17.66 6.34l2.12-2.12"/></svg>
+    Scroll zoom
+  </button>
+
+  <div class="ctrl-divider"></div>
+
+  <button class="ctrl-btn" id="btn-drag">
+    <svg viewBox="0 0 24 24"><polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/></svg>
+    Drag
+  </button>
+
+  <div class="ctrl-divider"></div>
+
+  <button class="ctrl-btn" id="btn-thumbnails">
+    <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+    Pág
+  </button>
+
+  <div class="ctrl-divider"></div>
+
+  <button class="ctrl-btn" id="btn-two-page">
+    <svg viewBox="0 0 24 24"><rect x="2" y="4" width="9" height="16" rx="1.5"/><rect x="13" y="4" width="9" height="16" rx="1.5"/></svg>
+    Doble
+  </button>
+</div>
+
+<div id="audio-player">
+  <button class="ap-btn" id="ap-toggle" title="Reproducir / pausar">
+    <svg id="ap-icon-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+    <svg id="ap-icon-pause" viewBox="0 0 24 24" style="display:none"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg>
+  </button>
+  <div class="ap-info">
+    <div class="ap-title" id="ap-title">—</div>
+    <div class="ap-bar" id="ap-bar"><div class="ap-bar-fill" id="ap-bar-fill"></div></div>
+  </div>
+  <button class="ap-close" id="ap-close" title="Cerrar">✕</button>
+</div>
+<audio id="pdf-audio" preload="none"></audio>
+
+<div id="embed-overlay">
+  <a id="embed-overlay-newtab" href="#" target="_blank" rel="noopener noreferrer">Abrir en pestaña nueva ↗</a>
+  <button id="embed-overlay-close" title="Cerrar">✕</button>
+  <div id="embed-overlay-content"></div>
+</div>
+
+<script>
+
+  // =====================================================================
+  // CONFIGURACION DE LA FUENTE DEL PDF
+  // =====================================================================
+  const MODE = "url"; // cambia a "github" para leer desde un repositorio
+
+  const PDF_SOURCE = {
+    url: "https://freight.cargo.site/m/D3073117167918755676788388934041/introaportalium-2.pdf",
+
+    github: {
+      owner: "notjuanluisongit",
+      repo: "portalium_contents",
+      branch: "main",
+      path: "introaportalium.pdf"
+    }
+  };
+
+  function resolvePdfUrl() {
+    if (MODE === "github") {
+      const g = PDF_SOURCE.github;
+      return `https://raw.githubusercontent.com/${g.owner}/${g.repo}/${g.branch}/${encodeURI(g.path)}`;
+    }
+    return PDF_SOURCE.url;
+  }
+
+  const PDF_URL = resolvePdfUrl();
+
+  // =====================================================================
+  // SITIOS QUE SE ABREN EN OVERLAY (en vez de pestaña nueva)
+  // =====================================================================
+  // Agrega aca cualquier dominio de un hipervinculo del PDF que quieras
+  // que, al hacer click, se abra flotando arriba (como el ejemplo de
+  // three.js) en vez de irse a una pestaña nueva. Sirve para paginas
+  // interactivas: demos, herramientas, simuladores, etc.
+  //
+  // Con que el link contenga ese dominio alcanza (no hace falta poner
+  // la URL completa ni la ruta exacta). Por ejemplo, con "threejs.org"
+  // en la lista, cualquier link que empiece con https://threejs.org/...
+  // se abre en overlay.
+  //
+  // OJO: esto solo funciona si el sitio en cuestion permite ser cargado
+  // dentro de un iframe. La mayoria de las paginas normales lo permiten,
+  // pero algunas (redes sociales, bancos, etc.) lo bloquean por
+  // seguridad — en esos casos el overlay va a quedar vacio, pero el
+  // boton "Abrir en pestaña nueva" siempre va a estar ahi como respaldo.
+  const EMBED_SITES = [
+    "threejs.org",
+    "ok.ru",
+    "codepen.io",
+    "codesandbox.io",
+    "jsfiddle.net",
+    "glitch.me",
+    "replit.com"
+    // "tu-sitio.com",  <-- agrega los tuyos asi, uno por linea
+  ];
+
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js";
+
+  const canvas = document.getElementById("pdf");
+  const ctx = canvas.getContext("2d");
+  const panLayer = document.getElementById("pan-layer");
+  const leaf1 = document.getElementById("leaf-1");
+  const leaf2 = document.getElementById("leaf-2");
+  const shade1 = document.getElementById("shade-1");
+  const shade2 = document.getElementById("shade-2");
+  const wrap = document.getElementById("canvas-wrap");
+  const viewer = document.getElementById("viewer");
+  const loader = document.getElementById("loader");
+  const errorBox = document.getElementById("error-box");
+  const pageInfo = document.getElementById("page-info");
+  const zoomInfo = document.getElementById("zoom-info");
+  const textLayerDiv = document.getElementById("text-layer");
+  const annotationLayerDiv = document.getElementById("annotation-layer");
+
+  // Modo 2 paginas (segundo slot)
+  const wrap2 = document.getElementById("canvas-wrap-2");
+  const canvas2 = document.getElementById("pdf-2");
+  const textLayerDiv2 = document.getElementById("text-layer-2");
+  const annotationLayerDiv2 = document.getElementById("annotation-layer-2");
+  const btnTwoPage = document.getElementById("btn-two-page");
+  let twoPageMode = false;
+
+  // Panel de capitulos (mapa visual de indice/bookmarks del PDF)
+  const chaptersPanel = document.getElementById("chapters-panel");
+  const chaptersTrack = document.getElementById("chapters-track");
+  const btnChapters = document.getElementById("btn-chapters");
+
+  // Panel de miniaturas
+  const thumbPanel = document.getElementById("thumbnails-panel");
+  const thumbTrack = document.getElementById("thumbnails-track");
+  const btnThumbnails = document.getElementById("btn-thumbnails");
+
+  // Panel de busqueda
+  const searchPanel = document.getElementById("search-panel");
+  const btnSearch = document.getElementById("btn-search");
+  const searchInput = document.getElementById("search-input");
+  const searchCount = document.getElementById("search-count");
+  const searchResultsDiv = document.getElementById("search-results");
+  const searchPrevBtn = document.getElementById("search-prev");
+  const searchNextBtn = document.getElementById("search-next");
+
+  // Pantalla completa
+  const btnFullscreen = document.getElementById("btn-fullscreen");
+
+  let pdfDoc = null;
+  let pageNum = 1;
+  let scale = 1;
+  let baseScale = 1;
+  let dragMode = false;
+  let scrollZoom = false;
+  // Distingue si la salida de pantalla completa fue pedida por el
+  // usuario clickeando el icono (true) o si fue el navegador saliendo
+  // por su cuenta (Escape) — solo en el segundo caso reintentamos
+  // volver a entrar, ver toggleFullscreen() y el keydown de Escape.
+  let fullscreenExitViaButton = false;
+  let dragging = false;
+  let animating = false;
+  let pos = { x: 0, y: 0 };
+  let start = { x: 0, y: 0 };
+  let activePointerId = null;
+
+  // Abre una URL en pestaña nueva de forma confiable. window.open(url,
+  // "_blank", "features...") puede interpretarse como pedido de
+  // VENTANA nueva en vez de pestaña en algunos navegadores/config, por
+  // llevar una cadena de "features" como tercer argumento. Simular el
+  // click de un <a target="_blank" rel="noopener noreferrer"> es el
+  // metodo que garantiza pestaña siempre, en cualquier navegador.
+  function openInNewTab(url) {
+    const a = document.createElement("a");
+    a.href = url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  // --- Suavizado del drag ---
+  // En vez de escribir el transform en CADA pointermove (que puede
+  // dispararse mas rapido de lo que el navegador pinta), guardamos la
+  // posicion pendiente y la aplicamos una sola vez por frame con
+  // requestAnimationFrame. Esto evita trabajo redundante de estilo y
+  // es lo que suele eliminar el "tartamudeo" al arrastrar.
+  let dragRAF = null;
+  let pendingPan = null;
+
+  function applyPan(x, y, useTransition) {
+    pos.x = x;
+    pos.y = y;
+    panLayer.style.transition = useTransition ? panLayer.style.transition : "none";
+    panLayer.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+  }
+
+  let zoomAnchor = null;
+
+  let renderGeneration = 0;
+  let wheelDebounceTimer = null;
+  let lastRenderedScale = 1;
+
+  // Igual que con el drag: la ruedita (sobre todo en trackpads) puede
+  // disparar el evento "wheel" muchas mas veces por segundo de las que
+  // el navegador pinta. Batcheamos el preview CSS con rAF por la misma
+  // razon.
+  let wheelPreviewRAF = null;
+  let pendingWheelScale = null;
+
+  function calcBaseScale(page) {
+    const vp = page.getViewport({ scale: 1 });
+    const scaleW = (window.innerWidth * 0.9) / vp.width;
+    const scaleH = (window.innerHeight - 60) / vp.height;
+    return Math.min(scaleW, scaleH);
+  }
+
+  // Valores de la sombra a zoom 100% (scale === baseScale). Deben ser
+  // los mismos numeros que el box-shadow declarado en el CSS del
+  // canvas, para que coincidan al cargar la pagina.
+  const SHADOW_BASE = [
+    { y: 14, blur: 44, color: "rgba(0,0,0,0.45)" },
+    { y: 4, blur: 16, color: "rgba(0,0,0,0.3)" }
+  ];
+
+  function updateCanvasShadow() {
+    const ratio = scale / baseScale;
+    canvas.style.boxShadow = SHADOW_BASE
+      .map(s => `0 ${s.y * ratio}px ${s.blur * ratio}px ${s.color}`)
+      .join(", ");
+  }
+
+  // -------------------------------------------------------------------
+  // FIX: antes, textLayerDiv/annotationLayerDiv podian quedar con
+  // pointer-events:none pegado si el drag terminaba mal (ver mas abajo).
+  // Como red de seguridad extra, cada vez que se termina de pintar una
+  // pagina (incluido despues de un zoom) forzamos que vuelvan a ser
+  // clickeables/seleccionables, sin depender de que el drag se haya
+  // cerrado "prolijo".
+  // -------------------------------------------------------------------
+  function ensureLayersInteractive() {
+    // OJO: el contenedor de anotaciones (annotationLayerDiv) SIEMPRE debe
+    // quedar en pointer-events:none. Es un div transparente del tamaño
+    // de toda la pagina; si se pone en "auto" completo, tapa el texto
+    // de punta a punta y no se puede seleccionar nada. Los links deben
+    // seguir siendo clickeables igual: eso lo logra cada <a> individual,
+    // que ya tiene su propio "pointer-events:auto" puesto inline (ver
+    // mas abajo, donde se crean). Un hijo con auto SI es clickeable
+    // aunque el padre este en none — por eso esto funciona.
+    textLayerDiv.style.pointerEvents = "auto";
+    annotationLayerDiv.style.pointerEvents = "none";
+  }
+
+  // =====================================================================
+  // CACHE DE PAGINAS RENDERIZADAS — cada pagina se dibuja una sola vez
+  // por escala (offscreen) y se guarda junto con su texto y sus
+  // anotaciones. Asi, cuando el usuario navega a una pagina que ya fue
+  // precargada, mostrarla es practicamente instantaneo (solo copiar un
+  // canvas), en vez de tener que esperar a pdf.js otra vez.
+  //
+  // Ademas de servir de cache, esto es lo que permite precargar de
+  // antemano las paginas siguientes (no solo sus miniaturas chiquitas,
+  // sino la pagina entera lista para mostrarse a tamaño real).
+  // =====================================================================
+  const pageCache = new Map(); // num -> {scale, canvas, vp, textContent, annotations, page}
+  const PAGE_CACHE_MAX = 6;
+  const pendingPageFetches = new Map(); // num -> Promise (evita pedir la misma pagina 2 veces en paralelo)
+
+  async function getRenderedPage(num, targetScale) {
+    const cached = pageCache.get(num);
+    if (cached && cached.scale === targetScale) return cached;
+
+    const key = num + "@" + targetScale;
+    if (pendingPageFetches.has(key)) return pendingPageFetches.get(key);
+
+    const job = (async () => {
+      const page = await pdfDoc.getPage(num);
+      const vp = page.getViewport({ scale: targetScale });
+
+      const off = document.createElement("canvas");
+      off.width = vp.width;
+      off.height = vp.height;
+      const offCtx = off.getContext("2d");
+      await page.render({ canvasContext: offCtx, viewport: vp }).promise;
+
+      const textContent = await page.getTextContent();
+      let annotations = [];
+      try { annotations = await page.getAnnotations(); } catch (e) {}
+
+      const entry = { scale: targetScale, canvas: off, vp, textContent, annotations, page };
+      pageCache.set(num, entry);
+
+      // Poda simple: si el cache crece demasiado, tira la entrada mas
+      // vieja que no sea la que acabamos de guardar (Map conserva el
+      // orden de insercion, asi que la primera clave es la mas vieja).
+      if (pageCache.size > PAGE_CACHE_MAX) {
+        for (const oldKey of pageCache.keys()) {
+          if (oldKey !== num) { pageCache.delete(oldKey); break; }
+        }
+      }
+
+      return entry;
+    })();
+
+    pendingPageFetches.set(key, job);
+    try {
+      return await job;
+    } finally {
+      pendingPageFetches.delete(key);
+    }
+  }
+
+  // Precarga en segundo plano (sin bloquear ni afectar lo que se ve
+  // ahora) las paginas indicadas, a la escala actual. Se llama despues
+  // de cada render exitoso con las 2 paginas siguientes (y la anterior,
+  // por si el usuario retrocede) como candidatas.
+  function prefetchPages(nums, targetScale) {
+    if (!pdfDoc) return;
+    nums.forEach(n => {
+      if (n < 1 || n > pdfDoc.numPages) return;
+      const cached = pageCache.get(n);
+      if (cached && cached.scale === targetScale) return;
+      getRenderedPage(n, targetScale).catch(() => {});
+    });
+  }
+
+  // Construye la capa de hipervinculos (links) de una pagina dentro de
+  // "layerDiv", a partir de una lista de anotaciones ya obtenida (no
+  // vuelve a pedirlas a pdf.js). Factorizado para poder usarse tanto en
+  // la pagina principal como en la segunda pagina del modo "2 paginas".
+  function renderAnnotationLayer(annotations, vp, layerDiv) {
+    // Si estabamos mostrando el preview de un link cuyo <a> vive dentro
+    // de esta capa, hay que ocultarlo ANTES de vaciar el contenedor: al
+    // borrar el <a> del DOM (innerHTML = ""), el navegador no dispara su
+    // "mouseleave", asi que el tooltip se quedaba pegado en pantalla
+    // (ver tambien hideLinkPreview() en goTo()).
+    hideLinkPreview();
+    layerDiv.innerHTML = "";
+    annotations.forEach(ann => {
+      if (ann.subtype !== "Link") return;
+
+      const rect = vp.convertToViewportRectangle(ann.rect);
+      const x1 = Math.min(rect[0], rect[2]);
+      const y1 = Math.min(rect[1], rect[3]);
+      const x2 = Math.max(rect[0], rect[2]);
+      const y2 = Math.max(rect[1], rect[3]);
+
+      const a = document.createElement("a");
+      a.style.position = "absolute";
+      a.style.left = x1 + "px";
+      a.style.top = y1 + "px";
+      a.style.width = (x2 - x1) + "px";
+      a.style.height = (y2 - y1) + "px";
+      a.style.display = "block";
+      a.style.pointerEvents = "auto";
+      a.style.cursor = "pointer";
+
+      const linkUrl = ann.url || ann.unsafeUrl || null;
+
+      if (linkUrl) {
+        a.href = linkUrl;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+
+        // Detecta si el link apunta a una imagen, a un audio, a un PDF
+        // (se abre en un mini visor de PDF propio, no en el visor
+        // nativo del navegador embebido en un iframe), a un video con
+        // oEmbed (YouTube/Vimeo), o a cualquier otro sitio, para darle
+        // un comportamiento especial de hover/click a cada uno.
+        const isImg = isImageUrl(linkUrl);
+        const isAudio = isAudioUrl(linkUrl);
+        const isPdf = !isImg && !isAudio && isPdfUrl(linkUrl);
+        const embedEndpoint = !isImg && !isAudio && !isPdf ? oembedEndpointFor(linkUrl) : null;
+        const isOembed = !!embedEndpoint;
+
+        a.addEventListener("mouseenter", (ev) => {
+          if (isImg) showImagePreview(linkUrl, ev);
+          else if (isAudio || isPdf || isFreightCargoUrl(linkUrl)) showFilePreview(linkUrl, ev);
+          else showLinkPreview(linkUrl, ev);
+        });
+        a.addEventListener("mousemove", (ev) => moveLinkPreview(ev));
+        a.addEventListener("mouseleave", hideLinkPreview);
+
+        if (isAudio) {
+          // No abre pestaña nueva ni overlay: carga/alterna el
+          // reproductor flotante. Shift+Click igual respeta el pedido
+          // de "pestaña nueva siempre con shift".
+          a.addEventListener("click", (ev) => {
+            ev.preventDefault();
+            if (ev.shiftKey) {
+              openInNewTab(linkUrl);
+            } else {
+              toggleAudioLink(linkUrl);
+            }
+          });
+        } else {
+          // Click normal (sin Shift): SIEMPRE se abre como overlay flotante
+          // sobre el visor, sea imagen, PDF, video con oEmbed o cualquier
+          // otro link — asi el usuario nunca sale de la pagina sin querer.
+          // Shift+Click: fuerza pestaña nueva, para cuando de verdad se
+          // quiere salir del visor.
+          a.addEventListener("click", (ev) => {
+            ev.preventDefault();
+
+            if (ev.shiftKey) {
+              openInNewTab(linkUrl);
+              return;
+            }
+
+            if (isImg) {
+              openImageOverlay(linkUrl);
+            } else if (isPdf) {
+              // PDF: mini visor propio (canvas + pdf.js), no el visor
+              // nativo del navegador dentro de un iframe.
+              openPdfViewerOverlay(linkUrl);
+            } else if (isOembed) {
+              openOembedOverlay(linkUrl, embedEndpoint);
+            } else {
+              // Sitios directos o cualquier otro link: iframe dentro
+              // del overlay. Si el sitio bloquea ser embebido, el
+              // boton "Abrir en pestaña nueva" del overlay sirve de
+              // respaldo.
+              openIframeOverlay(linkUrl);
+            }
+          });
+        }
+      } else if (typeof ann.dest !== "undefined" && ann.dest !== null) {
+        a.href = "#";
+        a.addEventListener("click", async (ev) => {
+          ev.preventDefault();
+          try {
+            let dest = ann.dest;
+            if (typeof dest === "string") {
+              dest = await pdfDoc.getDestination(dest);
+            }
+            if (dest && dest[0]) {
+              const pageIndex = await pdfDoc.getPageIndex(dest[0]);
+              goTo(pageIndex + 1, pageIndex + 1 > pageNum ? "next" : "prev");
+            }
+          } catch (e) {}
+        });
+      } else {
+        return;
+      }
+
+      layerDiv.appendChild(a);
+    });
+  }
+
+  async function renderPage(num) {
+    const myGeneration = ++renderGeneration;
+    const entry = await getRenderedPage(num, scale);
+
+    if (myGeneration !== renderGeneration) return;
+
+    const vp = entry.vp;
+
+    canvas.width = vp.width;
+    canvas.height = vp.height;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(entry.canvas, 0, 0);
+
+    wrap.style.transition = "none";
+    wrap.style.transform = "scale3d(1,1,1)";
+    wrap.style.transformOrigin = "";
+    lastRenderedScale = scale;
+
+    // La sombra del canvas (el "borde" que simula el papel) esta
+    // declarada con valores fijos en px. Durante el gesto de zoom la
+    // escalabamos con CSS junto con todo lo demas (arriba), pero al
+    // terminar el render final el transform vuelve a scale(1) y la
+    // sombra "fija" pegaba un salto visible al tamaño de base — eso es
+    // el achique/parpadeo de los bordes. La arreglamos haciendo que el
+    // valor declarado de la sombra sea proporcional al zoom actual, asi
+    // el salto desaparece: lo que se ve durante el gesto (sombra base
+    // escalada por CSS) y lo que queda despues del render final
+    // (sombra recalculada a mano) terminan siendo visualmente lo mismo.
+    updateCanvasShadow();
+
+    if (zoomAnchor) {
+      const targetLeft = zoomAnchor.centerX - vp.width / 2;
+      const targetTop = zoomAnchor.centerY - vp.height / 2;
+      const pointX = targetLeft + zoomAnchor.originXpct * vp.width;
+      const pointY = targetTop + zoomAnchor.originYpct * vp.height;
+      pos.x = zoomAnchor.cursorX - pointX;
+      pos.y = zoomAnchor.cursorY - pointY;
+      zoomAnchor = null;
+    }
+    applyPan(pos.x, pos.y);
+
+    textLayerDiv.style.width = vp.width + "px";
+    textLayerDiv.style.height = vp.height + "px";
+    textLayerDiv.innerHTML = "";
+
+    annotationLayerDiv.style.width = vp.width + "px";
+    annotationLayerDiv.style.height = vp.height + "px";
+    annotationLayerDiv.innerHTML = "";
+
+    // Reseteo defensivo: pase lo que pase con el drag, cada render deja
+    // las capas de texto/links interactivas de nuevo.
+    ensureLayersInteractive();
+
+    if (twoPageMode && num + 1 <= pdfDoc.numPages) {
+      pageInfo.textContent = num + "-" + (num + 1) + " / " + pdfDoc.numPages;
+    } else {
+      pageInfo.textContent = num + " / " + pdfDoc.numPages;
+    }
+    zoomInfo.textContent = Math.round((scale / baseScale) * 100) + "%";
+
+    // Si el panel de miniaturas / capitulos ya fue construido, marca el
+    // elemento de la pagina actual como activo.
+    if (thumbnailsBuilt) updateActiveThumbnail();
+    if (chaptersBuilt) updateActiveChapter();
+
+    try {
+      const textDivs = [];
+      const textLayerTask = pdfjsLib.renderTextLayer({
+        textContent: entry.textContent,
+        container: textLayerDiv,
+        viewport: vp,
+        textDivs: textDivs
+      });
+      if (textLayerTask && textLayerTask.promise) {
+        await textLayerTask.promise;
+      }
+      if (myGeneration !== renderGeneration) return;
+
+      // Guarda referencia a los spans/items de esta pagina y pinta el
+      // resaltado de busqueda si hay una consulta activa.
+      lastTextDivs = textDivs;
+      lastTextItems = entry.textContent.items;
+      applyPageHighlights(num, lastTextDivs, lastTextItems);
+    } catch (e) {
+      console.error("No se pudo generar la capa de texto seleccionable:", e);
+    }
+
+    try {
+      renderAnnotationLayer(entry.annotations, vp, annotationLayerDiv);
+    } catch (e) {
+      console.error("No se pudieron cargar los hyperlinks de esta pagina:", e);
+    }
+
+    // Precarga en segundo plano las 2 paginas siguientes (y la anterior,
+    // por si el usuario retrocede) a la escala actual, para que la
+    // proxima navegacion sea instantanea.
+    prefetchPages([num + 1, num + 2, num - 1], scale);
+
+    // Modo 2 paginas: renderiza la pagina compañera al lado.
+    if (twoPageMode) {
+      renderSecondaryPage(num + 1);
+    }
+  }
+
+  // =====================================================================
+  // MODO 2 PAGINAS — dibuja una segunda pagina (num) en el slot de al
+  // lado (#canvas-wrap-2), con su propia capa de texto y de links. Usa
+  // el mismo cache que la pagina principal, asi que si ya fue precargada
+  // aparece al instante.
+  // =====================================================================
+  async function renderSecondaryPage(num) {
+    const myGeneration = renderGeneration;
+
+    if (!pdfDoc || num < 1 || num > pdfDoc.numPages) {
+      wrap2.style.visibility = "hidden";
+      return;
+    }
+    wrap2.style.visibility = "visible";
+
+    const entry = await getRenderedPage(num, scale);
+    if (myGeneration !== renderGeneration || !twoPageMode) return;
+
+    const vp = entry.vp;
+    canvas2.width = vp.width;
+    canvas2.height = vp.height;
+    const ctx2 = canvas2.getContext("2d");
+    ctx2.clearRect(0, 0, canvas2.width, canvas2.height);
+    ctx2.drawImage(entry.canvas, 0, 0);
+    canvas2.style.boxShadow = canvas.style.boxShadow;
+
+    textLayerDiv2.style.width = vp.width + "px";
+    textLayerDiv2.style.height = vp.height + "px";
+    textLayerDiv2.innerHTML = "";
+    annotationLayerDiv2.style.width = vp.width + "px";
+    annotationLayerDiv2.style.height = vp.height + "px";
+    annotationLayerDiv2.innerHTML = "";
+
+    try {
+      const textDivs2 = [];
+      const task2 = pdfjsLib.renderTextLayer({
+        textContent: entry.textContent,
+        container: textLayerDiv2,
+        viewport: vp,
+        textDivs: textDivs2
+      });
+      if (task2 && task2.promise) await task2.promise;
+      if (myGeneration !== renderGeneration || !twoPageMode) return;
+    } catch (e) {}
+
+    try {
+      renderAnnotationLayer(entry.annotations, vp, annotationLayerDiv2);
+    } catch (e) {}
+
+    prefetchPages([num + 1, num + 2], scale);
+  }
+
+  // =====================================================================
+  // DETECCION DE TIPO DE ARCHIVO POR EXTENSION (imagen / audio)
+  // =====================================================================
+  const IMAGE_EXT_RE = /\.(jpe?g|png|gif|webp|bmp|svg)(\?.*)?(#.*)?$/i;
+  const AUDIO_EXT_RE = /\.(mp3|wav|ogg|m4a|aac|flac)(\?.*)?(#.*)?$/i;
+  const PDF_EXT_RE = /\.pdf(\?.*)?(#.*)?$/i;
+
+  function isImageUrl(url) { return IMAGE_EXT_RE.test(url); }
+  function isAudioUrl(url) { return AUDIO_EXT_RE.test(url); }
+  function isPdfUrl(url) { return PDF_EXT_RE.test(url); }
+
+  // Links que apuntan al CDN de archivos de Cargo (freight.cargo.site)
+  // no tienen un dominio "legible" para mostrar en el preview — en vez
+  // de mostrar "freight.cargo.site" y un favicon generico, se muestra
+  // el nombre real del archivo con un icono de documento.
+  function isFreightCargoUrl(url) {
+    try {
+      const host = new URL(url).hostname;
+      return host.includes("freight.cargo");
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Extrae el nombre de archivo de una URL (usado para el preview de
+  // archivos y el titulo del reproductor de audio).
+  function filenameFrom(url) {
+    try {
+      const clean = url.split("?")[0].split("#")[0];
+      return decodeURIComponent(clean.substring(clean.lastIndexOf("/") + 1)) || url;
+    } catch (e) {
+      return url;
+    }
+  }
+
+  const linkPreview = document.createElement("div");
+  linkPreview.id = "link-preview";
+  linkPreview.style.cssText = [
+    "position:fixed", "z-index:50", "display:none", "pointer-events:none",
+    "max-width:280px", "padding:8px 10px", "border-radius:10px",
+    "background:rgba(20,20,20,0.92)", "backdrop-filter:blur(6px)",
+    "box-shadow:0 6px 20px rgba(0,0,0,0.5)",
+    "color:rgba(255,255,255,0.92)", "font-family:Helvetica,Arial,sans-serif",
+    "font-size:0.72rem", "line-height:1.35",
+    "align-items:center", "gap:8px"
+  ].join(";");
+  document.body.appendChild(linkPreview);
+
+  const oembedCache = new Map();
+  let previewToken = 0;
+
+  function escapeHtml(str) {
+    const d = document.createElement("div");
+    d.textContent = str;
+    return d.innerHTML;
+  }
+
+  function oembedEndpointFor(url) {
+    if (/(?:youtube\.com\/(?:watch\?|shorts\/)|youtu\.be\/)/i.test(url)) {
+      return `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
+    }
+    if (/vimeo\.com\/\d+/i.test(url)) {
+      return `https://vimeo.com/api/oembed.json?url=${encodeURIComponent(url)}`;
+    }
+    return null;
+  }
+
+  function renderPreviewBasic(host, url) {
+    linkPreview.innerHTML = `
+      <img src="https://www.google.com/s2/favicons?sz=32&domain=${encodeURIComponent(host)}"
+           style="width:20px;height:20px;border-radius:4px;flex-shrink:0;" />
+      <div style="min-width:0;">
+        <div style="font-weight:600;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(host)}</div>
+        <div style="opacity:0.7;word-break:break-all;">${escapeHtml(url)}</div>
+      </div>
+    `;
+  }
+
+  function renderPreviewRich(data, host) {
+    const thumb = data.thumbnail_url
+      ? `<img src="${data.thumbnail_url}" style="width:56px;height:32px;object-fit:cover;border-radius:6px;flex-shrink:0;" />`
+      : "";
+    linkPreview.innerHTML = `
+      ${thumb}
+      <div style="min-width:0;">
+        <div style="font-weight:600;color:var(--accent);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">${escapeHtml(data.title || host)}</div>
+        ${data.author_name ? `<div style="opacity:0.7;">${escapeHtml(data.author_name)}</div>` : ""}
+      </div>
+    `;
+  }
+
+  function showLinkPreview(url, ev) {
+    const myToken = ++previewToken;
+    let host = url;
+    try { host = new URL(url).hostname; } catch (e) {}
+
+    linkPreview.classList.remove("image-preview");
+    renderPreviewBasic(host, url);
+    linkPreview.style.display = "flex";
+    moveLinkPreview(ev);
+
+    const endpoint = oembedEndpointFor(url);
+    if (!endpoint) return;
+
+    if (oembedCache.has(url)) {
+      const cached = oembedCache.get(url);
+      if (cached && myToken === previewToken) renderPreviewRich(cached, host);
+      return;
+    }
+
+    fetch(endpoint)
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => {
+        oembedCache.set(url, data);
+        if (data && myToken === previewToken) renderPreviewRich(data, host);
+      })
+      .catch(() => {
+        oembedCache.set(url, null);
+      });
+  }
+
+  // Preview para hyperlinks a audio, a PDF, o a archivos servidos desde
+  // freight.cargo.site: en vez de favicon + dominio (que en estos casos
+  // no dice nada util), muestra el nombre del archivo con un icono de
+  // documento.
+  function showFilePreview(url, ev) {
+    previewToken++; // invalida cualquier fetch de oEmbed pendiente
+    const name = filenameFrom(url);
+
+    linkPreview.classList.remove("image-preview");
+    linkPreview.innerHTML = `
+      <div style="width:26px;height:26px;border-radius:6px;flex-shrink:0;display:flex;align-items:center;justify-content:center;background:rgba(210,179,223,0.16);">
+        <svg viewBox="0 0 24 24" style="width:15px;height:15px;stroke:var(--accent);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+        </svg>
+      </div>
+      <div style="min-width:0;">
+        <div style="font-weight:600;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(name)}</div>
+      </div>
+    `;
+    linkPreview.style.display = "flex";
+    moveLinkPreview(ev);
+  }
+
+  // Preview grande para hyperlinks que apuntan directamente a una
+  // imagen: en vez de favicon + titulo, muestra la imagen real, mas
+  // grande, tipo "vista previa" (similar a como Notion/Figma previsualizan
+  // un link a una imagen).
+  function showImagePreview(url, ev) {
+    previewToken++; // invalida cualquier fetch de oEmbed pendiente
+    let host = url;
+    try { host = new URL(url).hostname; } catch (e) {}
+
+    linkPreview.classList.add("image-preview");
+    linkPreview.innerHTML = `
+      <img src="${url}" alt="" loading="lazy" />
+      <div class="image-preview-caption">${escapeHtml(host)}</div>
+    `;
+    linkPreview.style.display = "flex";
+    moveLinkPreview(ev);
+  }
+
+  function moveLinkPreview(ev) {
+    const offset = 16;
+    const rect = linkPreview.getBoundingClientRect();
+    const w = rect.width || 280;
+    const h = rect.height || 60;
+    let left = ev.clientX + offset;
+    let top = ev.clientY + offset;
+    if (left + w > window.innerWidth) left = ev.clientX - w - offset;
+    if (top + h > window.innerHeight) top = ev.clientY - h - offset;
+    linkPreview.style.left = left + "px";
+    linkPreview.style.top = top + "px";
+  }
+
+  function hideLinkPreview() {
+    linkPreview.style.display = "none";
+    linkPreview.classList.remove("image-preview");
+  }
+
+  // =====================================================================
+  // OVERLAY DE EMBED — renderiza el contenido real (video de YouTube/
+  // Vimeo via oEmbed, un mini visor de PDF, o un iframe directo para
+  // cualquier otro link) en vez de mostrar el codigo del embed o abrir
+  // pestaña nueva. Se cierra con la cruz arriba a la derecha, clickeando
+  // el fondo, o Esc.
+  // =====================================================================
+  const embedOverlay = document.getElementById("embed-overlay");
+  const embedOverlayContent = document.getElementById("embed-overlay-content");
+  const embedOverlayClose = document.getElementById("embed-overlay-close");
+  const embedOverlayNewTab = document.getElementById("embed-overlay-newtab");
+
+  // Documento pdf.js que este abierto actualmente dentro del mini
+  // visor (si hay uno). Se destruye al cerrar el overlay para liberar
+  // memoria y evitar que un render tardio de un PDF viejo se dibuje
+  // encima de uno nuevo.
+  let miniPdfDoc = null;
+
+  // Handlers de pagina anterior/siguiente del mini visor de PDF que
+  // esta abierto dentro del overlay (si hay uno). El listener global de
+  // teclado los usa para que, con el overlay abierto, las flechitas
+  // controlen el mini PDF en vez del PDF principal de fondo.
+  let miniPdfPrevHandler = null;
+  let miniPdfNextHandler = null;
+
+  function closeEmbedOverlay() {
+    embedOverlay.classList.remove("visible");
+    embedOverlayNewTab.classList.remove("visible");
+    if (miniPdfDoc) {
+      try { miniPdfDoc.destroy(); } catch (e) {}
+      miniPdfDoc = null;
+    }
+    miniPdfPrevHandler = null;
+    miniPdfNextHandler = null;
+    // Vaciar el contenido corta cualquier iframe/video que siga sonando.
+    embedOverlayContent.innerHTML = "";
+  }
+
+  function showEmbedLoading(url, wide) {
+    // Cualquier overlay nuevo que se abre invalida los handlers de
+    // navegacion del mini PDF anterior (si los habia).
+    miniPdfPrevHandler = null;
+    miniPdfNextHandler = null;
+    embedOverlayContent.classList.toggle("wide", !!wide);
+    embedOverlayContent.innerHTML = `
+      <div class="embed-overlay-loading"><span></span><span></span><span></span></div>
+    `;
+    embedOverlay.classList.add("visible");
+    embedOverlayNewTab.href = url;
+    embedOverlayNewTab.classList.add("visible");
+  }
+
+  // Para YouTube/Vimeo: pide el html real via oEmbed y lo inserta.
+  async function openOembedOverlay(url, endpoint) {
+    showEmbedLoading(url, false);
+
+    try {
+      let data = oembedCache.get(url);
+      if (data === undefined) {
+        const r = await fetch(endpoint);
+        data = r.ok ? await r.json() : null;
+        oembedCache.set(url, data);
+      }
+      // Si el overlay ya se cerro mientras cargaba, no pisamos nada.
+      if (!embedOverlay.classList.contains("visible")) return;
+
+      if (data && data.html) {
+        embedOverlayContent.innerHTML = data.html;
+      } else {
+        openInNewTab(url);
+        closeEmbedOverlay();
+      }
+    } catch (e) {
+      openInNewTab(url);
+      closeEmbedOverlay();
+    }
+  }
+
+  // Para cualquier otro link (sitios normales, etc.): arma un iframe
+  // directo a la URL. Si el sitio bloquea ser embebido
+  // (X-Frame-Options / CSP frame-ancestors), no hay forma de detectarlo
+  // desde JS por CORS — por eso siempre queda visible el boton "Abrir en
+  // pestaña nueva" como respaldo.
+  function openIframeOverlay(url) {
+    showEmbedLoading(url, true);
+    const iframe = document.createElement("iframe");
+    iframe.src = url;
+    iframe.allow = "fullscreen; autoplay; accelerometer; gyroscope";
+    iframe.setAttribute("allowfullscreen", "");
+    embedOverlayContent.innerHTML = "";
+    embedOverlayContent.appendChild(iframe);
+  }
+
+  // -----------------------------------------------------------------
+  // MINI VISOR DE PDF — para hyperlinks que apuntan a un .pdf. En vez
+  // de meter el PDF en un iframe (que hace que el navegador abra su
+  // propio visor nativo, con toda su interfaz ajena al resto del
+  // sitio), esto dibuja las paginas a mano con pdf.js sobre un canvas,
+  // con solo anterior/siguiente e indicador de pagina — un visor
+  // simple, liviano, y visualmente consistente con el resto del sitio.
+  // -----------------------------------------------------------------
+  async function openPdfViewerOverlay(url) {
+    showEmbedLoading(url, true);
+
+    embedOverlayContent.innerHTML = `
+      <div class="mini-pdf-viewer">
+        <div class="mini-pdf-canvas-wrap">
+          <canvas id="mini-pdf-canvas"></canvas>
+        </div>
+        <div class="mini-pdf-controls">
+          <button class="mini-pdf-btn" id="mini-pdf-prev" title="Página anterior">
+            <svg viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+          <span id="mini-pdf-info">— / —</span>
+          <button class="mini-pdf-btn" id="mini-pdf-next" title="Página siguiente">
+            <svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></svg>
+          </button>
+        </div>
+      </div>
+    `;
+
+    const miniCanvas = document.getElementById("mini-pdf-canvas");
+    const miniCtx = miniCanvas.getContext("2d");
+    const infoEl = document.getElementById("mini-pdf-info");
+    const prevBtn = document.getElementById("mini-pdf-prev");
+    const nextBtn = document.getElementById("mini-pdf-next");
+    const canvasWrap = embedOverlayContent.querySelector(".mini-pdf-canvas-wrap");
+
+    let localNum = 1;
+    let rendering = false;
+    let renderQueued = false;
+
+    async function renderMiniPage(n) {
+      if (!miniPdfDoc) return;
+      if (rendering) { renderQueued = true; return; }
+      rendering = true;
+
+      const page = await miniPdfDoc.getPage(n);
+      const vp1 = page.getViewport({ scale: 1 });
+      const availW = Math.max(canvasWrap.clientWidth - 8, 100);
+      const availH = Math.max(canvasWrap.clientHeight - 8, 100);
+      const s = Math.min(availW / vp1.width, availH / vp1.height);
+      const vp = page.getViewport({ scale: Math.max(s, 0.1) });
+
+      miniCanvas.width = vp.width;
+      miniCanvas.height = vp.height;
+      await page.render({ canvasContext: miniCtx, viewport: vp }).promise;
+
+      localNum = n;
+      infoEl.textContent = n + " / " + miniPdfDoc.numPages;
+      prevBtn.disabled = n <= 1;
+      nextBtn.disabled = n >= miniPdfDoc.numPages;
+
+      rendering = false;
+      if (renderQueued) {
+        renderQueued = false;
+        renderMiniPage(localNum);
+      }
+    }
+
+    prevBtn.addEventListener("click", () => {
+      if (localNum > 1) renderMiniPage(localNum - 1);
+    });
+    nextBtn.addEventListener("click", () => {
+      if (miniPdfDoc && localNum < miniPdfDoc.numPages) renderMiniPage(localNum + 1);
+    });
+
+    // Expone estos handlers al listener de teclado global, asi con el
+    // overlay abierto las flechitas del teclado navegan este mini PDF
+    // en vez del PDF principal que esta de fondo.
+    miniPdfPrevHandler = () => { if (localNum > 1) renderMiniPage(localNum - 1); };
+    miniPdfNextHandler = () => { if (miniPdfDoc && localNum < miniPdfDoc.numPages) renderMiniPage(localNum + 1); };
+
+    try {
+      if (miniPdfDoc) { try { miniPdfDoc.destroy(); } catch (e) {} }
+      miniPdfDoc = await pdfjsLib.getDocument(url).promise;
+      // Si el overlay se cerro mientras cargaba, no seguimos.
+      if (!embedOverlay.classList.contains("visible")) return;
+      await renderMiniPage(1);
+    } catch (e) {
+      embedOverlayContent.innerHTML =
+        '<div style="color:var(--text);opacity:0.7;padding:20px;text-align:center;font-size:0.8rem;">No se pudo cargar el PDF.</div>';
+    }
+  }
+
+  // Para hyperlinks a imagenes: muestra la imagen grande, centrada,
+  // respetando su proporcion real (a diferencia del recorte 16:9 de los
+  // videos).
+  function openImageOverlay(url) {
+    embedOverlayContent.classList.add("wide");
+    embedOverlayContent.innerHTML = "";
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = "";
+    img.style.maxWidth = "100%";
+    img.style.maxHeight = "100%";
+    img.style.objectFit = "contain";
+    img.style.display = "block";
+    embedOverlayContent.appendChild(img);
+    embedOverlay.classList.add("visible");
+    embedOverlayNewTab.href = url;
+    embedOverlayNewTab.classList.add("visible");
+  }
+
+  embedOverlayClose.addEventListener("click", closeEmbedOverlay);
+  embedOverlay.addEventListener("click", (ev) => {
+    // Clickear el fondo oscuro (fuera del contenido) tambien cierra.
+    if (ev.target === embedOverlay) closeEmbedOverlay();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+
+    // Escape cierra el overlay si hay uno abierto (esto SI lo podemos
+    // controlar nosotros, a diferencia del fullscreen).
+    if (embedOverlay.classList.contains("visible")) {
+      closeEmbedOverlay();
+    }
+
+    // El navegador sale de fullscreen automaticamente al presionar
+    // Escape — es un comportamiento nativo de seguridad que ningun
+    // sitio puede bloquear ni cancelar desde JS (ni con
+    // preventDefault() ni deteniendo la propagacion del evento). Como
+    // la idea es que la pantalla completa SOLO se cierre clickeando su
+    // propio icono, la unica salida es detectar que se salio por su
+    // cuenta y volver a pedirla enseguida.
+    const wasFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    if (wasFullscreen) {
+      requestAnimationFrame(() => {
+        const stillNotFs = !(document.fullscreenElement || document.webkitFullscreenElement);
+        if (stillNotFs && !fullscreenExitViaButton) {
+          const target = document.documentElement;
+          const req = target.requestFullscreen || target.webkitRequestFullscreen ||
+                      target.mozRequestFullScreen || target.msRequestFullscreen;
+          if (req) req.call(target).catch(() => {});
+        }
+        fullscreenExitViaButton = false;
+      });
+    }
+  });
+
+  // =====================================================================
+  // REPRODUCTOR DE AUDIO FLOTANTE (para hyperlinks que apuntan a audio)
+  // =====================================================================
+  const audioEl = document.getElementById("pdf-audio");
+  const audioPlayer = document.getElementById("audio-player");
+  const apToggleBtn = document.getElementById("ap-toggle");
+  const apIconPlay = document.getElementById("ap-icon-play");
+  const apIconPause = document.getElementById("ap-icon-pause");
+  const apTitle = document.getElementById("ap-title");
+  const apBar = document.getElementById("ap-bar");
+  const apBarFill = document.getElementById("ap-bar-fill");
+  const apClose = document.getElementById("ap-close");
+
+  let currentAudioUrl = null;
+
+  function setAudioIcon(isPlaying) {
+    apIconPlay.style.display = isPlaying ? "none" : "block";
+    apIconPause.style.display = isPlaying ? "block" : "none";
+  }
+
+  function toggleAudioLink(url) {
+    // Si es el mismo audio que ya esta cargado: solo alterna play/pausa.
+    if (currentAudioUrl === url) {
+      if (audioEl.paused) audioEl.play().catch(() => {});
+      else audioEl.pause();
+      return;
+    }
+    // Audio distinto: lo carga y arranca a reproducir.
+    currentAudioUrl = url;
+    audioEl.src = url;
+    apTitle.textContent = filenameFrom(url);
+    apBarFill.style.width = "0%";
+    audioPlayer.classList.add("visible");
+    audioEl.play().catch(() => {});
+  }
+
+  audioEl.addEventListener("play", () => setAudioIcon(true));
+  audioEl.addEventListener("pause", () => setAudioIcon(false));
+  audioEl.addEventListener("ended", () => setAudioIcon(false));
+  audioEl.addEventListener("timeupdate", () => {
+    if (audioEl.duration) {
+      apBarFill.style.width = (audioEl.currentTime / audioEl.duration) * 100 + "%";
+    }
+  });
+
+  apToggleBtn.addEventListener("click", () => {
+    if (!currentAudioUrl) return;
+    if (audioEl.paused) audioEl.play().catch(() => {});
+    else audioEl.pause();
+  });
+
+  apBar.addEventListener("click", (ev) => {
+    if (!audioEl.duration) return;
+    const rect = apBar.getBoundingClientRect();
+    const pct = (ev.clientX - rect.left) / rect.width;
+    audioEl.currentTime = Math.max(0, Math.min(1, pct)) * audioEl.duration;
+  });
+
+  apClose.addEventListener("click", () => {
+    audioEl.pause();
+    audioEl.removeAttribute("src");
+    audioEl.load();
+    currentAudioUrl = null;
+    audioPlayer.classList.remove("visible");
+  });
+
+  // =====================================================================
+  // PANEL DE MINIATURAS — se puede activar/desactivar con el boton
+  // "Miniaturas" de la barra inferior. Las miniaturas se construyen una
+  // sola vez (la primera vez que se abre el panel) y quedan cacheadas
+  // como <canvas> chiquitos, asi que abrir/cerrar despues es instantaneo.
+  // =====================================================================
+  const THUMB_WIDTH = 72; // ancho en px de cada miniatura
+  let thumbnailsBuilt = false;
+  let thumbnailsBuilding = false;
+
+  async function buildThumbnails() {
+    if (thumbnailsBuilt || thumbnailsBuilding || !pdfDoc) return;
+    thumbnailsBuilding = true;
+    thumbTrack.innerHTML = "";
+
+    for (let n = 1; n <= pdfDoc.numPages; n++) {
+      const item = document.createElement("div");
+      item.className = "thumb-item";
+      item.dataset.page = String(n);
+
+      const wrapDiv = document.createElement("div");
+      wrapDiv.className = "thumb-canvas-wrap";
+      wrapDiv.style.width = THUMB_WIDTH + "px";
+
+      const loadingDiv = document.createElement("div");
+      loadingDiv.className = "thumb-loading";
+      loadingDiv.innerHTML = '<div class="loader-dot"></div>';
+      wrapDiv.appendChild(loadingDiv);
+
+      const label = document.createElement("div");
+      label.className = "thumb-label";
+      label.textContent = String(n);
+
+      item.appendChild(wrapDiv);
+      item.appendChild(label);
+
+      item.addEventListener("click", () => {
+        if (n === pageNum) return;
+        goTo(n, n > pageNum ? "next" : "prev");
+      });
+
+      thumbTrack.appendChild(item);
+    }
+
+    thumbnailsBuilt = true;
+    thumbnailsBuilding = false;
+    updateActiveThumbnail();
+
+    // Renderiza las miniaturas de a una para no trabar el hilo principal
+    // si el PDF tiene muchas paginas.
+    renderThumbnailsSequentially();
+  }
+
+  async function renderThumbnailsSequentially() {
+    for (let n = 1; n <= pdfDoc.numPages; n++) {
+      await renderThumbnail(n);
+    }
+  }
+
+  async function renderThumbnail(n) {
+    const item = thumbTrack.querySelector('.thumb-item[data-page="' + n + '"]');
+    if (!item) return;
+    const wrapDiv = item.querySelector(".thumb-canvas-wrap");
+    if (!wrapDiv || wrapDiv.dataset.rendered === "1") return;
+
+    try {
+      const page = await pdfDoc.getPage(n);
+      const vp1 = page.getViewport({ scale: 1 });
+      const tScale = THUMB_WIDTH / vp1.width;
+      const vp = page.getViewport({ scale: tScale });
+
+      const tCanvas = document.createElement("canvas");
+      tCanvas.width = vp.width;
+      tCanvas.height = vp.height;
+      const tCtx = tCanvas.getContext("2d");
+
+      await page.render({ canvasContext: tCtx, viewport: vp }).promise;
+
+      wrapDiv.style.height = vp.height + "px";
+      wrapDiv.innerHTML = "";
+      wrapDiv.appendChild(tCanvas);
+      wrapDiv.dataset.rendered = "1";
+    } catch (e) {
+      console.error("No se pudo generar la miniatura de la pagina " + n + ":", e);
+    }
+  }
+
+  function updateActiveThumbnail() {
+    const items = thumbTrack.querySelectorAll(".thumb-item");
+    items.forEach(it => {
+      const isActive = Number(it.dataset.page) === pageNum;
+      it.classList.toggle("active", isActive);
+      if (isActive) {
+        it.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+      }
+    });
+  }
+
+  btnThumbnails.addEventListener("click", async () => {
+    const willShow = !thumbPanel.classList.contains("visible");
+    closeSearchPanel();
+    closeChaptersPanel();
+    thumbPanel.classList.toggle("visible", willShow);
+    btnThumbnails.classList.toggle("active", willShow);
+    if (willShow) {
+      await buildThumbnails();
+      updateActiveThumbnail();
+    }
+  });
+
+  // =====================================================================
+  // MAPA DE CAPITULOS — arma un panel visual a partir del indice/
+  // bookmarks del PDF (pdfDoc.getOutline()). Cada capitulo de primer
+  // nivel se muestra como una tarjeta con miniatura + titulo; los
+  // sub-capitulos se listan debajo, indentados. Si el PDF no trae
+  // indice, se avisa en vez de mostrar un panel vacio.
+  // =====================================================================
+  let chaptersBuilt = false;
+  let chaptersBuilding = false;
+  let flatChapters = []; // [{page, el}] usado para marcar el capitulo activo
+
+  async function resolveOutlineDest(dest) {
+    try {
+      let d = dest;
+      if (typeof d === "string") d = await pdfDoc.getDestination(d);
+      if (d && d[0]) {
+        const pageIndex = await pdfDoc.getPageIndex(d[0]);
+        return pageIndex + 1;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  async function makeChapterThumb(pageNumForThumb) {
+    const wrapDiv = document.createElement("div");
+    wrapDiv.className = "chapter-thumb";
+    wrapDiv.innerHTML = '<div class="loader-dot"></div>';
+    if (pageNumForThumb) {
+      try {
+        const page = await pdfDoc.getPage(pageNumForThumb);
+        const vp1 = page.getViewport({ scale: 1 });
+        const tScale = 120 / vp1.width;
+        const vp = page.getViewport({ scale: tScale });
+        const tCanvas = document.createElement("canvas");
+        tCanvas.width = vp.width;
+        tCanvas.height = vp.height;
+        await page.render({ canvasContext: tCanvas.getContext("2d"), viewport: vp }).promise;
+        wrapDiv.innerHTML = "";
+        wrapDiv.appendChild(tCanvas);
+      } catch (e) {
+        wrapDiv.innerHTML = "";
+      }
+    }
+    return wrapDiv;
+  }
+
+  async function buildChapters() {
+    if (chaptersBuilt || chaptersBuilding || !pdfDoc) return;
+    chaptersBuilding = true;
+    chaptersTrack.innerHTML = '<div class="chapters-empty">Cargando índice…</div>';
+
+    let outline = [];
+    try {
+      outline = await pdfDoc.getOutline() || [];
+    } catch (e) {
+      outline = [];
+    }
+
+    chaptersTrack.innerHTML = "";
+    flatChapters = [];
+
+    if (!outline.length) {
+      chaptersTrack.innerHTML = '<div class="chapters-empty">Este documento no tiene un índice de capítulos.</div>';
+      chaptersBuilt = true;
+      chaptersBuilding = false;
+      return;
+    }
+
+    for (const item of outline) {
+      const targetPage = await resolveOutlineDest(item.dest);
+
+      const card = document.createElement("div");
+      card.className = "chapter-card";
+      if (targetPage) card.dataset.page = String(targetPage);
+
+      const thumb = await makeChapterThumb(targetPage);
+      card.appendChild(thumb);
+
+      const title = document.createElement("div");
+      title.className = "chapter-title";
+      title.innerHTML = escapeHtml(item.title || "Sin título") +
+        (targetPage ? `<span class="chapter-page">Pág. ${targetPage}</span>` : "");
+      card.appendChild(title);
+
+      if (targetPage) {
+        card.addEventListener("click", () => {
+          goTo(targetPage, targetPage > pageNum ? "next" : "prev");
+        });
+        flatChapters.push({ page: targetPage, el: card });
+      }
+
+      // Sub-capitulos: se listan como texto simple debajo del titulo,
+      // indentados, cada uno tambien clickeable.
+      if (item.items && item.items.length) {
+        const subList = document.createElement("div");
+        subList.className = "chapter-subitem";
+        for (const sub of item.items) {
+          const subPage = await resolveOutlineDest(sub.dest);
+          const subLine = document.createElement("div");
+          subLine.className = "chapter-title";
+          subLine.style.cursor = subPage ? "pointer" : "default";
+          subLine.style.opacity = "0.75";
+          subLine.textContent = sub.title || "Sin título";
+          if (subPage) {
+            subLine.addEventListener("click", (ev) => {
+              ev.stopPropagation();
+              goTo(subPage, subPage > pageNum ? "next" : "prev");
+            });
+            flatChapters.push({ page: subPage, el: subLine });
+          }
+          subList.appendChild(subLine);
+        }
+        card.appendChild(subList);
+      }
+
+      chaptersTrack.appendChild(card);
+    }
+
+    chaptersBuilt = true;
+    chaptersBuilding = false;
+    updateActiveChapter();
+  }
+
+  function updateActiveChapter() {
+    flatChapters.forEach(({ page, el }) => {
+      el.classList.toggle("active", page === pageNum);
+    });
+  }
+
+  function openChaptersPanel() {
+    thumbPanel.classList.remove("visible");
+    btnThumbnails.classList.remove("active");
+    closeSearchPanel();
+    chaptersPanel.classList.add("visible");
+    btnChapters.classList.add("active");
+  }
+
+  function closeChaptersPanel() {
+    chaptersPanel.classList.remove("visible");
+    btnChapters.classList.remove("active");
+  }
+
+  btnChapters.addEventListener("click", async () => {
+    const willShow = !chaptersPanel.classList.contains("visible");
+    if (willShow) {
+      openChaptersPanel();
+      await buildChapters();
+      updateActiveChapter();
+    } else {
+      closeChaptersPanel();
+    }
+  });
+
+  // =====================================================================
+  // BUSQUEDA DE TEXTO EN EL DOCUMENTO — extrae y cachea el texto de cada
+  // pagina (una sola vez, la primera vez que se busca algo), compara sin
+  // tildes/mayusculas, y lista los resultados con pagina + fragmento
+  // resaltado. Click en un resultado (o Enter / flechas) navega ahi.
+  //
+  // Busqueda "flexible": algunos PDFs (sobre todo los exportados con
+  // ciertos kernings/tracking) extraen el texto con espacios sueltos
+  // entre letras, tipo "h o l a" en vez de "hola". Para que la busqueda
+  // encuentre esos casos igual, el patron se arma dejando un \s* opcional
+  // entre cada letra del termino buscado. Asi "hola" encuentra tanto
+  // "hola" como "h o l a" en el documento, y viceversa: si el usuario
+  // escribe "h o l a" tambien encuentra "hola".
+  // =====================================================================
+  let pageTextCache = {};
+  let pageItemOffsets = {}; // por pagina: [{start,end}] de cada item de texto dentro de pageTextCache[n]
+  let searchResults = [];
+  let searchActiveIndex = -1;
+  let searchDebounceTimer = null;
+  let currentSearchQuery = "";
+
+  // Referencias al ultimo textLayer renderizado, para poder reaplicar
+  // el resaltado (por ejemplo al pasar al siguiente resultado dentro de
+  // la misma pagina) sin tener que re-renderizar toda la pagina.
+  let lastTextDivs = [];
+  let lastTextItems = [];
+
+  function normalizeText(s) {
+    return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  }
+
+  function escapeRegExp(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  // Arma un regex que ignora espacios entre las letras del termino de
+  // busqueda: primero le saca los espacios al query (para no importar
+  // si el usuario escribio "h o l a" o "hola"), y despues junta cada
+  // letra con "\s*" para que tambien matchee si el PDF trae el texto
+  // con espacios sueltos entre caracteres.
+  function buildFlexibleRegex(query, flags) {
+    const chars = query.replace(/\s+/g, "").split("");
+    if (!chars.length) return null;
+    const pattern = chars.map(escapeRegExp).join("\\s*");
+    return new RegExp(pattern, flags || "gi");
+  }
+
+  async function ensurePageTextCached(n) {
+    if (pageTextCache[n] !== undefined) return pageTextCache[n];
+    const page = await pdfDoc.getPage(n);
+    const tc = await page.getTextContent();
+    const text = tc.items.map(it => it.str).join(" ");
+    pageTextCache[n] = text;
+
+    // Guarda el rango [start,end) que ocupa cada item dentro del texto
+    // de la pagina (el mismo texto que se arma con join(" ") arriba),
+    // para poder mapear despues una coincidencia de busqueda de vuelta
+    // al span de texto exacto que hay que resaltar.
+    const offsets = [];
+    let cursor = 0;
+    tc.items.forEach(it => {
+      const len = it.str.length;
+      offsets.push({ start: cursor, end: cursor + len });
+      cursor += len + 1; // +1 por el espacio separador del join(" ")
+    });
+    pageItemOffsets[n] = offsets;
+
+    return text;
+  }
+
+  async function ensureAllPagesCached() {
+    for (let n = 1; n <= pdfDoc.numPages; n++) {
+      await ensurePageTextCached(n);
+    }
+  }
+
+  async function runSearch(rawQuery) {
+    const query = rawQuery.trim();
+    currentSearchQuery = query;
+
+    if (!query || !pdfDoc) {
+      searchResults = [];
+      searchActiveIndex = -1;
+      renderSearchResults(query);
+      refreshHighlights();
+      return;
+    }
+
+    await ensureAllPagesCached();
+
+    const re = buildFlexibleRegex(normalizeText(query), "g");
+    const results = [];
+
+    if (re) {
+      for (let n = 1; n <= pdfDoc.numPages; n++) {
+        const text = pageTextCache[n] || "";
+        const norm = normalizeText(text);
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(norm)) !== null) {
+          const idx = m.index;
+          const matchLen = m[0].length;
+          const start = Math.max(0, idx - 30);
+          const end = Math.min(text.length, idx + matchLen + 30);
+          let snippet = text.substring(start, end).trim();
+          if (start > 0) snippet = "…" + snippet;
+          if (end < text.length) snippet = snippet + "…";
+          // start/end (sin el margen de contexto) son la posicion real
+          // de la coincidencia dentro del texto de la pagina — se usan
+          // para resaltarla directamente sobre el texto renderizado.
+          results.push({ page: n, snippet: snippet, start: idx, end: idx + matchLen });
+          // Evita loop infinito si por algun motivo el match tuviera
+          // longitud 0 (no deberia pasar con letras reales, pero por
+          // las dudas).
+          re.lastIndex = matchLen > 0 ? idx + matchLen : idx + 1;
+        }
+      }
+    }
+
+    searchResults = results;
+    searchActiveIndex = results.length ? 0 : -1;
+    renderSearchResults(query);
+    refreshHighlights();
+    if (results.length) goToSearchResult(0);
+  }
+
+  // Vuelve a pintar el resaltado sobre el texto de la pagina actual,
+  // usando los spans de la ultima capa de texto renderizada. Sirve
+  // tanto para cuando cambia la busqueda como para cuando se navega
+  // entre resultados que caen en la misma pagina (donde no hace falta
+  // re-renderizar la pagina entera).
+  function refreshHighlights() {
+    applyPageHighlights(pageNum, lastTextDivs, lastTextItems);
+  }
+
+  // Pinta (o limpia) los <mark> de resaltado sobre los spans de texto
+  // de una pagina, en base a "searchResults" y "currentSearchQuery".
+  // Primero siempre resetea los spans a su texto plano original (asi
+  // se limpian resaltados de una busqueda anterior), y despues, si hay
+  // consulta activa, vuelve a marcar las coincidencias que caigan en
+  // esta pagina.
+  function applyPageHighlights(num, textDivs, items) {
+    if (!textDivs || !textDivs.length || !items || !items.length) return;
+
+    textDivs.forEach((span, idx) => {
+      if (!span) return;
+      const original = items[idx] ? items[idx].str : "";
+      span.textContent = original;
+    });
+
+    if (!currentSearchQuery || !searchResults.length) return;
+
+    const offsets = pageItemOffsets[num];
+    if (!offsets) return;
+
+    // Agrupa, por item de texto, todos los rangos locales que hay que
+    // resaltar (un mismo item puede recibir texto de mas de una
+    // coincidencia).
+    const perItemRanges = new Map();
+    searchResults.forEach((r, i) => {
+      if (r.page !== num) return;
+      const isActive = i === searchActiveIndex;
+      for (let itemIdx = 0; itemIdx < offsets.length; itemIdx++) {
+        const off = offsets[itemIdx];
+        const overlapStart = Math.max(off.start, r.start);
+        const overlapEnd = Math.min(off.end, r.end);
+        if (overlapStart < overlapEnd) {
+          const list = perItemRanges.get(itemIdx) || [];
+          list.push({ start: overlapStart - off.start, end: overlapEnd - off.start, active: isActive });
+          perItemRanges.set(itemIdx, list);
+        }
+      }
+    });
+
+    perItemRanges.forEach((ranges, itemIdx) => {
+      const span = textDivs[itemIdx];
+      const text = items[itemIdx] ? items[itemIdx].str : "";
+      if (!span || !text) return;
+
+      ranges.sort((a, b) => a.start - b.start);
+      let html = "";
+      let cursor = 0;
+      ranges.forEach(rg => {
+        if (rg.start > cursor) html += escapeHtml(text.slice(cursor, rg.start));
+        const cls = "search-highlight" + (rg.active ? " search-highlight-active" : "");
+        html += `<mark class="${cls}">${escapeHtml(text.slice(rg.start, rg.end))}</mark>`;
+        cursor = Math.max(cursor, rg.end);
+      });
+      if (cursor < text.length) html += escapeHtml(text.slice(cursor));
+      span.innerHTML = html;
+    });
+  }
+
+  function highlightSnippet(snippet, query) {
+    const escapedSnippet = escapeHtml(snippet);
+    const re = buildFlexibleRegex(query, "gi");
+    if (!re) return escapedSnippet;
+    try {
+      return escapedSnippet.replace(re, m => "<mark>" + m + "</mark>");
+    } catch (e) {
+      return escapedSnippet;
+    }
+  }
+
+  function renderSearchResults(query) {
+    searchResultsDiv.innerHTML = "";
+
+    if (!query) {
+      searchCount.textContent = "";
+      const hint = document.createElement("div");
+      hint.className = "search-hint";
+      hint.textContent = "Escribe para buscar en todas las paginas.";
+      searchResultsDiv.appendChild(hint);
+      return;
+    }
+
+    if (!searchResults.length) {
+      searchCount.textContent = "0";
+      const empty = document.createElement("div");
+      empty.className = "search-empty";
+      empty.textContent = "Sin resultados.";
+      searchResultsDiv.appendChild(empty);
+      return;
+    }
+
+    searchCount.textContent = (searchActiveIndex + 1) + " / " + searchResults.length;
+
+    searchResults.forEach((r, i) => {
+      const item = document.createElement("div");
+      item.className = "search-result-item" + (i === searchActiveIndex ? " active-match" : "");
+
+      const pageTag = document.createElement("div");
+      pageTag.className = "search-result-page";
+      pageTag.textContent = "Pág. " + r.page;
+
+      const snippetDiv = document.createElement("div");
+      snippetDiv.className = "search-result-snippet";
+      snippetDiv.innerHTML = highlightSnippet(r.snippet, query);
+
+      item.appendChild(pageTag);
+      item.appendChild(snippetDiv);
+      item.addEventListener("click", () => goToSearchResult(i));
+
+      searchResultsDiv.appendChild(item);
+    });
+  }
+
+  function goToSearchResult(i) {
+    if (!searchResults[i]) return;
+    searchActiveIndex = i;
+    renderSearchResults(searchInput.value.trim());
+
+    const target = searchResults[i].page;
+    if (target !== pageNum) {
+      goTo(target, target > pageNum ? "next" : "prev");
+    } else {
+      // Ya estamos en la pagina correcta: no hace falta re-renderizar,
+      // solo actualizar cual resaltado queda marcado como "activo".
+      refreshHighlights();
+    }
+
+    const activeEl = searchResultsDiv.children[i];
+    if (activeEl) activeEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  function searchStep(delta) {
+    if (!searchResults.length) return;
+    let next = searchActiveIndex + delta;
+    if (next < 0) next = searchResults.length - 1;
+    if (next >= searchResults.length) next = 0;
+    goToSearchResult(next);
+  }
+
+  searchInput.addEventListener("input", () => {
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(() => runSearch(searchInput.value), 250);
+  });
+
+  searchInput.addEventListener("keydown", (ev) => {
+    // Evita que las teclas de navegacion del visor (flechas, +/-, 0, t)
+    // se disparen mientras se esta escribiendo aca — ver el listener
+    // global mas abajo, que ya chequea esto, pero ademas frenamos la
+    // propagacion aca por las dudas de que algo mas este escuchando en
+    // el documento.
+    ev.stopPropagation();
+
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      if (ev.shiftKey) searchStep(-1);
+      else searchStep(1);
+    }
+    if (ev.key === "Escape") {
+      closeSearchPanel();
+    }
+  });
+
+  searchPrevBtn.addEventListener("click", () => searchStep(-1));
+  searchNextBtn.addEventListener("click", () => searchStep(1));
+
+  function openSearchPanel() {
+    thumbPanel.classList.remove("visible");
+    btnThumbnails.classList.remove("active");
+    closeChaptersPanel();
+    searchPanel.classList.add("visible");
+    btnSearch.classList.add("active");
+    renderSearchResults(searchInput.value.trim());
+    setTimeout(() => searchInput.focus(), 50);
+  }
+
+  function closeSearchPanel() {
+    searchPanel.classList.remove("visible");
+    btnSearch.classList.remove("active");
+
+    // Al cerrar el buscador se "deselecciona": se limpia la consulta,
+    // los resultados y el resaltado que haya quedado pintado sobre el
+    // texto de la pagina actual, asi no queda nada marcado de una
+    // busqueda anterior.
+    clearTimeout(searchDebounceTimer);
+    currentSearchQuery = "";
+    searchResults = [];
+    searchActiveIndex = -1;
+    searchInput.value = "";
+    searchCount.textContent = "";
+    searchResultsDiv.innerHTML = "";
+    refreshHighlights();
+  }
+
+  btnSearch.addEventListener("click", () => {
+    if (searchPanel.classList.contains("visible")) closeSearchPanel();
+    else openSearchPanel();
+  });
+
+  // =====================================================================
+  // PANTALLA COMPLETA — usa la Fullscreen API estandar (con prefijos por
+  // si acaso). Se activa y se DESACTIVA "de forma intencional" unicamente
+  // haciendo click en el icono de la barra superior (toggleFullscreen).
+  // Si el navegador sale de fullscreen por su cuenta al presionar Escape,
+  // el listener de Escape (mas arriba) detecta ese cierre "no intencional"
+  // y vuelve a pedir fullscreen enseguida — ver fullscreenExitViaButton.
+  //
+  // OJO: como este visor normalmente vive dentro de un <iframe> embebido
+  // en Cargo, para que esto funcione ahi el iframe que lo contiene
+  // necesita el atributo "allowfullscreen" (o allow="fullscreen"). Si el
+  // sitio que lo embebe no lo tiene, el navegador va a bloquear el
+  // pedido silenciosamente.
+  // =====================================================================
+  function toggleFullscreen() {
+    const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    if (!isFs) {
+      const target = document.documentElement;
+      const req = target.requestFullscreen || target.webkitRequestFullscreen ||
+                  target.mozRequestFullScreen || target.msRequestFullscreen;
+      if (req) req.call(target).catch(() => {});
+    } else {
+      // Marca que esta salida es intencional (boton), para que el
+      // listener de Escape no intente re-forzar el fullscreen despues.
+      fullscreenExitViaButton = true;
+      const exit = document.exitFullscreen || document.webkitExitFullscreen ||
+                    document.mozCancelFullScreen || document.msExitFullscreen;
+      if (exit) exit.call(document).catch ? exit.call(document).catch(() => {}) : exit.call(document);
+    }
+  }
+
+  function syncFullscreenBtn() {
+    const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+    btnFullscreen.classList.toggle("active", isFs);
+  }
+
+  btnFullscreen.addEventListener("click", toggleFullscreen);
+  document.addEventListener("fullscreenchange", syncFullscreenBtn);
+  document.addEventListener("webkitfullscreenchange", syncFullscreenBtn);
+
+  function resetPosition() {
+    pos = { x: 0, y: 0 };
+    panLayer.style.transition = "none";
+    panLayer.style.transform = "translate3d(0,0,0)";
+    panLayer.style.opacity = "1";
+  }
+
+  // =====================================================================
+  // ANIMACION DE "PASAR PAGINA" (hecha a mano, sin librerias externas)
+  // =====================================================================
+  // En modo UNA pagina, toda la vista es una sola hoja, asi que la que
+  // gira es #pan-layer entero (como antes).
+  //
+  // En modo DOS paginas, si giraramos #pan-layer entero (que contiene
+  // las dos hojas juntas) el spread se veria como si fuera una unica
+  // placa plana doblandose por la mitad — no como pasar una pagina de
+  // un libro. Para que se vea bien, en modo doble SOLO gira la hoja que
+  // corresponde:
+  //   - "next": gira la hoja de la DERECHA (leaf-2), con bisagra en su
+  //     propio borde izquierdo (el lomo del libro), como si esa pagina
+  //     se cerrara hacia la izquierda tapando la otra.
+  //   - "prev": gira la hoja de la IZQUIERDA (leaf-1), con bisagra en
+  //     su propio borde derecho, cerrandose hacia la derecha.
+  // La otra hoja del spread (la "companera") no gira en 3D — solo recibe
+  // un leve fundido de opacidad + escala sincronizado con el flip de la
+  // que si gira, para que su cambio de contenido no aparezca como un
+  // "pop" seco, sin que eso agregue una segunda animacion 3D pesada.
+  function getFlipTarget(dir) {
+    if (!twoPageMode) {
+      return {
+        el: panLayer,
+        shade: shade1,
+        companion: null,
+        companionShade: null,
+        outOrigin: dir === "next" ? "0% 50%" : "100% 50%",
+        outRotate: dir === "next" ? "-130deg" : "130deg",
+        inOrigin: dir === "next" ? "100% 50%" : "0% 50%",
+        inRotate: dir === "next" ? "110deg" : "-110deg"
+      };
+    }
+    if (dir === "next") {
+      return {
+        el: leaf2, shade: shade2, companion: leaf1, companionShade: shade1,
+        outOrigin: "0% 50%", outRotate: "-130deg", inOrigin: "100% 50%", inRotate: "110deg"
+      };
+    }
+    return {
+      el: leaf1, shade: shade1, companion: leaf2, companionShade: shade2,
+      outOrigin: "100% 50%", outRotate: "130deg", inOrigin: "0% 50%", inRotate: "-110deg"
+    };
+  }
+
+  async function goTo(num, dir) {
+    if (!pdfDoc || animating) return;
+    if (num < 1 || num > pdfDoc.numPages) return;
+    animating = true;
+
+    // FIX: si el cursor estaba flotando sobre un hyperlink cuando se
+    // pasa de pagina (con las flechitas, el teclado, un resultado de
+    // busqueda, etc.), el <a> correspondiente va a ser destruido y
+    // reconstruido por renderAnnotationLayer() sin que el navegador
+    // dispare "mouseleave" sobre el — asi es como el tooltip de preview
+    // se quedaba pegado en pantalla ("permanente"). Ocultarlo aca,
+    // apenas arranca la navegacion, asegura que nunca quede huerfano.
+    hideLinkPreview();
+
+    const target = getFlipTarget(dir);
+    const el = target.el;
+    const shade = target.shade;
+    const companion = target.companion;
+    const isWholeLayer = el === panLayer;
+
+    if (!isWholeLayer) el.style.zIndex = "5";
+
+    // Precarga en paralelo el/los destino(s) mientras arranca la
+    // animacion de salida, asi el instante del "swap" (cuando la hoja
+    // esta de canto) nunca tiene que esperar a pdf.js — esa espera a
+    // mitad de la animacion era la causa de los freezes/stutter, sobre
+    // todo la primera vez que se visita una pagina lejana o en modo 2
+    // paginas (2 canvases a renderizar en vez de 1).
+    const preloadNums = twoPageMode ? [num, num + 1] : [num];
+    const preloadPromise = Promise.all(
+      preloadNums
+        .filter(n => n >= 1 && n <= pdfDoc.numPages)
+        .map(n => getRenderedPage(n, scale).catch(() => {}))
+    );
+
+    // Fase de salida: la hoja que corresponde se "cierra" girando sobre
+    // su propio lomo, con un leve achique. La sombra de la hoja al
+    // doblarse se simula con el div .flip-shade (opacity, barato) en vez
+    // de un filter:brightness sobre el canvas (caro de repintar).
+    el.style.transformOrigin = target.outOrigin;
+    el.style.transition = "transform 0.36s cubic-bezier(0.6,0.04,0.98,0.34), opacity 0.34s ease";
+    el.style.transform = `rotateY(${target.outRotate}) scale3d(0.94,0.94,1)`;
+    el.style.opacity = "0.15";
+    if (shade) {
+      shade.style.transition = "opacity 0.36s ease";
+      shade.style.opacity = "0.45";
+    }
+    if (companion) {
+      companion.style.transition = "opacity 0.3s ease, transform 0.3s ease";
+      companion.style.transform = "scale3d(0.985,0.985,1)";
+      companion.style.opacity = "0.55";
+    }
+
+    await Promise.all([new Promise(r => setTimeout(r, 360)), preloadPromise]);
+
+    pageNum = num;
+
+    // La hoja entrante arranca doblada desde el borde opuesto (como si
+    // viniera "de atras" del libro) y se despliega hasta quedar plana.
+    el.style.transition = "none";
+    el.style.transformOrigin = target.inOrigin;
+    el.style.transform = `rotateY(${target.inRotate}) scale3d(0.94,0.94,1)`;
+    el.style.opacity = "0.15";
+
+    // Actualiza el contenido (ambas hojas si es modo doble) mientras la
+    // hoja que gira esta de canto — es el momento en que menos se nota
+    // el cambio de contenido, y como ya se precargo arriba, esto ahora
+    // resuelve casi al instante en vez de trabar la animacion.
+    await renderPage(pageNum);
+
+    requestAnimationFrame(() => {
+      el.style.transition = "transform 0.4s cubic-bezier(0.22,0.61,0.36,1), opacity 0.36s ease";
+      el.style.transform = "rotateY(0deg) scale3d(1,1,1)";
+      el.style.opacity = "1";
+      if (shade) {
+        shade.style.transition = "opacity 0.4s ease";
+        shade.style.opacity = "0";
+      }
+      if (companion) {
+        companion.style.transition = "opacity 0.36s ease, transform 0.36s ease";
+        companion.style.transform = "scale3d(1,1,1)";
+        companion.style.opacity = "1";
+      }
+      setTimeout(() => {
+        animating = false;
+        el.style.transformOrigin = "50% 50%";
+        if (!isWholeLayer) el.style.zIndex = "";
+      }, 400);
+    });
+  }
+
+  // =====================================================================
+  // TOGGLE MODO 2 PAGINAS — muestra la pagina actual y la siguiente lado
+  // a lado, tipo libro/web-archive. La navegacion "siguiente/anterior"
+  // en este modo avanza de a 2 paginas.
+  // =====================================================================
+  function resetLeafTransform(el) {
+    el.style.transition = "none";
+    el.style.transform = "";
+    el.style.transformOrigin = "50% 50%";
+    el.style.opacity = "1";
+    el.style.zIndex = "";
+    const shade = el.querySelector(".flip-shade");
+    if (shade) {
+      shade.style.transition = "none";
+      shade.style.opacity = "0";
+    }
+  }
+
+  function setTwoPageMode(on) {
+    twoPageMode = on;
+    btnTwoPage.classList.toggle("active", on);
+    resetLeafTransform(leaf1);
+    resetLeafTransform(leaf2);
+    leaf2.style.display = on ? "block" : "none";
+    if (on) {
+      // Alinea al inicio de un "spread" par para que el libro quede
+      // prolijo (pagina 1 sola tipo portada, 2-3 juntas, etc).
+      if (pageNum % 2 === 0 && pageNum > 1) pageNum -= 1;
+      renderPage(pageNum);
+    } else {
+      wrap2.style.visibility = "hidden";
+    }
+  }
+
+  btnTwoPage.addEventListener("click", () => setTwoPageMode(!twoPageMode));
+
+  function cancelWheelPreview() {
+    if (wheelPreviewRAF !== null) {
+      cancelAnimationFrame(wheelPreviewRAF);
+      wheelPreviewRAF = null;
+    }
+    pendingWheelScale = null;
+  }
+
+  function zoomBy(delta) {
+    clearTimeout(wheelDebounceTimer);
+    wheelDebounceTimer = null;
+    cancelWheelPreview();
+    zoomAnchor = null;
+    scale = Math.max(baseScale * 0.5, Math.min(baseScale * 5, scale + delta));
+    renderPage(pageNum);
+  }
+
+  function resetZoom() {
+    clearTimeout(wheelDebounceTimer);
+    wheelDebounceTimer = null;
+    cancelWheelPreview();
+    zoomAnchor = null;
+    scale = baseScale;
+    resetPosition();
+    renderPage(pageNum);
+  }
+
+  function zoomByWheel(e, delta) {
+    const newScale = Math.max(baseScale * 0.5, Math.min(baseScale * 5, scale + delta));
+    if (newScale === scale) return;
+
+    if (!wheelDebounceTimer) {
+      const rect = canvas.getBoundingClientRect();
+      const viewerRect = viewer.getBoundingClientRect();
+      zoomAnchor = {
+        originXpct: (e.clientX - rect.left) / rect.width,
+        originYpct: (e.clientY - rect.top) / rect.height,
+        cursorX: e.clientX,
+        cursorY: e.clientY,
+        centerX: viewerRect.left + viewerRect.width / 2,
+        centerY: viewerRect.top + viewerRect.height / 2
+      };
+      wrap.style.transformOrigin = `${zoomAnchor.originXpct * 100}% ${zoomAnchor.originYpct * 100}%`;
+    }
+
+    scale = newScale;
+    pendingWheelScale = scale / lastRenderedScale;
+    zoomInfo.textContent = Math.round((scale / baseScale) * 100) + "%";
+
+    if (wheelPreviewRAF === null) {
+      wheelPreviewRAF = requestAnimationFrame(() => {
+        wheelPreviewRAF = null;
+        if (pendingWheelScale !== null) {
+          wrap.style.transition = "none";
+          wrap.style.transform = `scale3d(${pendingWheelScale}, ${pendingWheelScale}, 1)`;
+          pendingWheelScale = null;
+        }
+      });
+    }
+
+    clearTimeout(wheelDebounceTimer);
+    wheelDebounceTimer = setTimeout(() => {
+      wheelDebounceTimer = null;
+      renderPage(pageNum);
+    }, 120);
+  }
+
+  async function loadPdf() {
+    try {
+      pdfDoc = await pdfjsLib.getDocument(PDF_URL).promise;
+      const page = await pdfDoc.getPage(1);
+      baseScale = calcBaseScale(page);
+      scale = baseScale;
+      lastRenderedScale = baseScale;
+      await renderPage(1);
+      loader.classList.add("hidden");
+    } catch (err) {
+      loader.classList.add("hidden");
+      errorBox.style.display = "flex";
+      errorBox.textContent = "No se pudo cargar el PDF. Revisa la URL o, si estas usando el modo GitHub, que el repositorio sea publico y la ruta del archivo sea correcta. (" + (err && err.message ? err.message : err) + ")";
+    }
+  }
+
+  loadPdf();
+
+  // NAV
+  function stepSize() { return twoPageMode ? 2 : 1; }
+
+  document.getElementById("btn-prev").onclick = () => goTo(pageNum - stepSize(), "prev");
+  document.getElementById("btn-next").onclick = () => goTo(pageNum + stepSize(), "next");
+  document.getElementById("zone-prev").onclick = () => goTo(pageNum - stepSize(), "prev");
+  document.getElementById("zone-next").onclick = () => goTo(pageNum + stepSize(), "next");
+
+  // ZOOM
+  document.getElementById("btn-zoom-in").onclick = () => zoomBy(baseScale * 0.25);
+  document.getElementById("btn-zoom-out").onclick = () => zoomBy(-baseScale * 0.25);
+  document.getElementById("btn-reset").onclick = resetZoom;
+
+  // SCROLL ZOOM TOGGLE
+  document.getElementById("btn-scroll-zoom").onclick = function() {
+    scrollZoom = !scrollZoom;
+    this.classList.toggle("active", scrollZoom);
+  };
+
+  // DRAG TOGGLE
+  document.getElementById("btn-drag").onclick = function() {
+    dragMode = !dragMode;
+    this.classList.toggle("active", dragMode);
+    viewer.style.cursor = dragMode ? "grab" : "default";
+  };
+
+  // SCROLL (zoom con ruedita)
+  viewer.addEventListener("wheel", e => {
+    if (!scrollZoom) return;
+    e.preventDefault();
+    zoomByWheel(e, e.deltaY < 0 ? baseScale * 0.12 : -baseScale * 0.12);
+  }, { passive: false });
+
+  // -------------------------------------------------------------------
+  // DRAG (arreglado)
+  // -------------------------------------------------------------------
+  // ANTES: usaba mousedown/mousemove/mouseup en "window". El problema es
+  // que este visor vive dentro de un <iframe> (Cargo). Si arrastras y
+  // sueltas el boton del mouse FUERA del iframe (sobre el resto de tu
+  // pagina), el "mouseup" nunca llega a este documento, entonces
+  // "dragging" queda pegado en true y el pointer-events:none que le
+  // pusimos al texto/links durante el drag nunca se revierte. Asi
+  // quedaba "roto" el texto seleccionable hasta recargar la pagina.
+  //
+  // AHORA: usamos Pointer Events + setPointerCapture. Con la captura,
+  // el navegador sigue mandando los eventos de pointer al elemento que
+  // inicio el drag aunque el cursor salga del iframe, asi que el
+  // "pointerup" (o "pointercancel") SIEMPRE llega, sin importar donde
+  // se suelte el mouse. Ademas se agregan un par de redes de seguridad
+  // extra (blur de la ventana, mouseleave del documento, cambio de
+  // visibilidad) por si el navegador no soporta bien la captura en ese
+  // contexto embebido.
+  // -------------------------------------------------------------------
+
+  function endDrag() {
+    if (!dragging) return;
+    dragging = false;
+    if (dragRAF !== null) {
+      cancelAnimationFrame(dragRAF);
+      dragRAF = null;
+    }
+    pendingPan = null;
+    if (dragMode) viewer.style.cursor = "grab";
+    ensureLayersInteractive();
+    if (activePointerId !== null) {
+      try { viewer.releasePointerCapture(activePointerId); } catch (e) {}
+      activePointerId = null;
+    }
+  }
+
+  viewer.addEventListener("pointerdown", e => {
+    if (!dragMode) return;
+    dragging = true;
+    activePointerId = e.pointerId;
+    try { viewer.setPointerCapture(e.pointerId); } catch (err) {}
+    viewer.style.cursor = "grabbing";
+    start.x = e.clientX - pos.x;
+    start.y = e.clientY - pos.y;
+    textLayerDiv.style.pointerEvents = "none";
+    annotationLayerDiv.style.pointerEvents = "none";
+  });
+
+  // El pointermove puede dispararse muchas mas veces por segundo de lo
+  // que el navegador realmente pinta. Si escribimos el transform en
+  // cada uno, se acumula trabajo de estilo que el navegador no llega a
+  // absorber a tiempo y eso se percibe como tartamudeo. Aca solo
+  // guardamos la posicion mas reciente ("pendingPan") y un unico
+  // requestAnimationFrame por vuelo se encarga de pintarla — como
+  // maximo una actualizacion visual por frame, sincronizada con el
+  // refresco real de la pantalla.
+  viewer.addEventListener("pointermove", e => {
+    if (!dragging || !dragMode) return;
+    pendingPan = {
+      x: e.clientX - start.x,
+      y: e.clientY - start.y
+    };
+    if (dragRAF === null) {
+      dragRAF = requestAnimationFrame(() => {
+        dragRAF = null;
+        if (pendingPan) {
+          applyPan(pendingPan.x, pendingPan.y);
+          pendingPan = null;
+        }
+      });
+    }
+  });
+
+  viewer.addEventListener("pointerup", endDrag);
+  viewer.addEventListener("pointercancel", endDrag);
+
+  // Redes de seguridad extra: si por algun motivo el pointerup/pointercancel
+  // no llega, cualquiera de estos eventos fuerza el cierre del drag y
+  // restaura el texto/links seleccionables.
+  window.addEventListener("blur", endDrag);
+  document.addEventListener("mouseleave", endDrag);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) endDrag();
+  });
+
+  // DOBLE CLICK (solo si no hay seleccion de texto activa)
+  viewer.addEventListener("dblclick", () => {
+    const sel = window.getSelection();
+    if (sel && sel.toString().length > 0) return;
+    resetZoom();
+  });
+
+  // TECLADO
+  document.addEventListener("keydown", e => {
+    // No disparar ningun hotkey del visor mientras se esta escribiendo
+    // en un campo de texto (el buscador, o cualquier otro input/textarea
+    // que pueda existir). Sin esto, escribir "hola" en el buscador
+    // tambien movia paginas (por la "h") o hacia zoom (por la "0").
+    const activeTag = document.activeElement && document.activeElement.tagName;
+    if (activeTag === "INPUT" || activeTag === "TEXTAREA" || (document.activeElement && document.activeElement.isContentEditable)) {
+      return;
+    }
+
+    // FIX: si hay un overlay abierto (imagen, video, iframe, o el mini
+    // visor de PDF), las flechitas deben controlar ESE overlay y no el
+    // PDF principal que quedo de fondo. Si el overlay es el mini visor
+    // de PDF, las flechas pasan/retroceden sus paginas; para cualquier
+    // otro tipo de overlay (imagen, video, iframe), simplemente se
+    // bloquea la navegacion del visor principal, ya que no tiene
+    // sentido pasar de pagina detras de un overlay abierto.
+    if (embedOverlay.classList.contains("visible")) {
+      if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+        e.preventDefault();
+        if (miniPdfNextHandler) miniPdfNextHandler();
+        return;
+      }
+      if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+        e.preventDefault();
+        if (miniPdfPrevHandler) miniPdfPrevHandler();
+        return;
+      }
+      // Cualquier otra tecla de navegacion (zoom, reset, miniaturas)
+      // tampoco debe afectar al visor de fondo mientras el overlay
+      // esta abierto.
+      if (e.key === "+" || e.key === "-" || e.key === "0" || e.key.toLowerCase() === "t") {
+        return;
+      }
+    }
+
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") goTo(pageNum + stepSize(), "next");
+    if (e.key === "ArrowLeft" || e.key === "ArrowUp") goTo(pageNum - stepSize(), "prev");
+    if (e.key === "+") zoomBy(baseScale * 0.25);
+    if (e.key === "-") zoomBy(-baseScale * 0.25);
+    if (e.key === "0") resetZoom();
+    if (e.key.toLowerCase() === "t") btnThumbnails.click();
+  });
+
+  // RESIZE
+  window.addEventListener("resize", async () => {
+    if (!pdfDoc) return;
+    clearTimeout(wheelDebounceTimer);
+    wheelDebounceTimer = null;
+    cancelWheelPreview();
+    zoomAnchor = null;
+    const page = await pdfDoc.getPage(pageNum);
+    baseScale = calcBaseScale(page);
+    scale = baseScale;
+    resetPosition();
+    renderPage(pageNum);
+  });
+
+</script>
+</body>
+</html>
